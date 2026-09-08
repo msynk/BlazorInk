@@ -23,6 +23,7 @@ public sealed class HistoryManager : IDisposable
     private List<HistoryEntry>? _group;
     private string? _groupLabel;
     private int _groupDepth;
+    private bool _discardGroup;
     private bool _applying;
     private bool _disposed;
 
@@ -70,8 +71,10 @@ public sealed class HistoryManager : IDisposable
     {
         if (_undo.Count == 0 || _groupDepth > 0) return false;
         HistoryEntry entry = _undo[^1];
+        // The step is only removed once it has been applied. Dropping it first would lose it for good if the
+        // document refused the change, for example because a collaborator already deleted the element.
+        if (!ApplyEntry(entry.Inverse, ChangeOrigin.Undo)) return false;
         _undo.RemoveAt(_undo.Count - 1);
-        ApplyEntry(entry.Inverse, ChangeOrigin.Undo);
         _redo.Add(entry);
         Changed?.Invoke(this, EventArgs.Empty);
         return true;
@@ -82,19 +85,27 @@ public sealed class HistoryManager : IDisposable
     {
         if (_redo.Count == 0 || _groupDepth > 0) return false;
         HistoryEntry entry = _redo[^1];
+        if (!ApplyEntry(entry.Forward, ChangeOrigin.Redo)) return false;
         _redo.RemoveAt(_redo.Count - 1);
-        ApplyEntry(entry.Forward, ChangeOrigin.Redo);
         _undo.Add(entry);
         Changed?.Invoke(this, EventArgs.Empty);
         return true;
     }
 
-    private void ApplyEntry(DrawingOperation operation, ChangeOrigin origin)
+    /// <summary>Applies a history step. Returns false when the document could not accept it.</summary>
+    private bool ApplyEntry(DrawingOperation operation, ChangeOrigin origin)
     {
         _applying = true;
         try
         {
             _document.Apply(operation, origin);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            // The document moved on underneath this step, typically because a collaborator removed something it
+            // refers to. The step stays where it is rather than vanishing.
+            return false;
         }
         finally
         {
@@ -130,9 +141,22 @@ public sealed class HistoryManager : IDisposable
         if (--_groupDepth > 0) return;
         List<HistoryEntry> entries = _group!;
         _group = null;
-        if (entries.Count == 0) return;
+        bool discard = _discardGroup;
+        _discardGroup = false;
+        if (discard || entries.Count == 0) return;
         HistoryEntry merged = Merge(entries, _groupLabel);
         Push(merged);
+    }
+
+    /// <summary>
+    /// Discards the open group instead of recording it. A cancelled gesture has already been reversed in the
+    /// document, so recording it and its reversal would leave the user with an undo step that does nothing.
+    /// </summary>
+    public void CancelGroup()
+    {
+        if (_groupDepth == 0) return;
+        _group?.Clear();
+        _discardGroup = true;
     }
 
     private static HistoryEntry Merge(List<HistoryEntry> entries, string? label)
@@ -177,11 +201,25 @@ public sealed class HistoryManager : IDisposable
         }
     }
 
-    /// <summary>Stops recording.</summary>
+    /// <summary>
+    /// Closes any group left open by a tool that was interrupted. A group that is never closed silently disables
+    /// undo, so the host calls this whenever a gesture is abandoned.
+    /// </summary>
+    public void EndOpenGroups()
+    {
+        while (_groupDepth > 0)
+        {
+            _groupDepth = 1;
+            EndGroup();
+        }
+    }
+
+    /// <summary>Stops recording. Any group left open by a tool is closed, so history is never left disabled.</summary>
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
         _document.Changed -= OnDocumentChanged;
+        EndOpenGroups();
     }
 }

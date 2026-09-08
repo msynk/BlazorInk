@@ -34,6 +34,9 @@ public sealed class TextTool : ToolBase
     /// <summary>The element currently being edited, if any.</summary>
     public TextElement? Editing { get; private set; }
 
+    private IDisposable? _creationGroup;
+    private Guid? _createdElementId;
+
     /// <summary>Raised when the host should show or move a text editor.</summary>
     public event Action<TextEditRequest>? EditRequested;
 
@@ -54,12 +57,28 @@ public sealed class TextTool : ToolBase
             return true;
         }
 
+        if (context.Document.TryGetLayer(context.ActiveLayerId, out Layer? layer) && (layer.IsLocked || !layer.IsVisible)) return false;
+
         var element = new TextElement(doc, string.Empty)
         {
             Style = Style with { Color = context.ShapeStyle.StrokeColor },
             Size = new Vector2(DefaultWidth, Style.FontSize * Style.LineHeight),
         };
-        context.Document.AddElement(element, context.ActiveLayerId);
+        // Placing the box and typing into it is one action to the user, so it is one undo step. The group opens
+        // before the element is added and stays open until the edit is committed or cancelled.
+        _creationGroup = context.History.BeginGroup("Add text");
+        try
+        {
+            context.Document.AddElement(element, context.ActiveLayerId);
+        }
+        catch (InvalidOperationException ex)
+        {
+            context.Announce("Text could not be added: " + ex.Message);
+            EndCreationGroup();
+            return false;
+        }
+
+        _createdElementId = element.Id;
         BeginEdit(context, element);
         return true;
     }
@@ -87,19 +106,38 @@ public sealed class TextTool : ToolBase
         TextElement? element = Editing;
         Editing = null;
         EditFinished?.Invoke();
-        if (element is null) return;
-        if (!context.Document.ContainsElement(element.Id)) return;
-
-        if (string.IsNullOrWhiteSpace(text))
+        if (element is null)
         {
-            context.Document.RemoveElement(element.Id);
-            context.InvalidateDocument(element.Bounds);
+            EndCreationGroup();
             return;
         }
-        var updated = element with { Text = text, Size = measuredSize };
-        context.Document.ReplaceElement(updated);
-        context.InvalidateDocument(updated.Bounds.Union(element.Bounds));
-        context.Announce("Text updated.");
+        if (!context.Document.ContainsElement(element.Id))
+        {
+            EndCreationGroup();
+            return;
+        }
+
+        try
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                context.Document.RemoveElement(element.Id);
+                context.InvalidateDocument(element.Bounds);
+                return;
+            }
+            var updated = element with { Text = text, Size = measuredSize };
+            context.Document.ReplaceElement(updated);
+            context.InvalidateDocument(updated.Bounds.Union(element.Bounds));
+            context.Announce("Text updated.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            context.Announce("The text could not be saved: " + ex.Message);
+        }
+        finally
+        {
+            EndCreationGroup();
+        }
     }
 
     /// <summary>Cancels editing, removing the element when it was newly created and is still empty.</summary>
@@ -112,12 +150,27 @@ public sealed class TextTool : ToolBase
         if (element is not null && element.Text.Length == 0 && context.Document.ContainsElement(element.Id))
         {
             context.Document.RemoveElement(element.Id);
+            // The box was created and removed within this gesture, so it never happened as far as undo cares.
+            if (_createdElementId == element.Id) context.History.CancelGroup();
         }
+        EndCreationGroup();
         context.InvalidateOverlay();
     }
 
     /// <inheritdoc />
-    public override void Deactivate(IToolContext context) => CancelEdit(context);
+    public override void Deactivate(IToolContext context)
+    {
+        CancelEdit(context);
+        EndCreationGroup();
+    }
+
+    /// <summary>Closes the undo group that spans placing a text box and typing into it.</summary>
+    private void EndCreationGroup()
+    {
+        _creationGroup?.Dispose();
+        _creationGroup = null;
+        _createdElementId = null;
+    }
 
     /// <inheritdoc />
     public override void DrawOverlay(IToolContext context, IRenderContext render)

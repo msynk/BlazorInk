@@ -395,28 +395,44 @@ public sealed class CollaborationSession : IAsyncDisposable
             return;
         }
 
+        // Build the whole change first, then apply it. Removing the local content before discovering that the
+        // incoming document does not fit would destroy the user's work and leave nothing in its place.
+        var operations = new List<DrawingOperation>();
+        foreach (Layer layer in _document.Layers)
+        {
+            foreach (InkElement element in layer.Elements) operations.Add(new RemoveElementOperation(element.Id));
+        }
+
+        // Add the incoming layers before removing the local ones that are gone: a document must always keep at
+        // least one layer, and removing them first would trip that rule.
+        foreach (Layer layer in incoming.Layers)
+        {
+            if (_document.TryGetLayer(layer.Id, out _))
+            {
+                operations.Add(new UpdateLayerOperation(layer.Id, layer.Properties));
+                foreach (InkElement element in layer.Elements) operations.Add(new AddElementOperation(layer.Id, element));
+            }
+            else
+            {
+                operations.Add(new AddLayerOperation(layer.Id, layer.Properties, null, layer.Elements.ToArray()));
+            }
+        }
+        foreach (Layer layer in _document.Layers)
+        {
+            if (!incoming.TryGetLayer(layer.Id, out _)) operations.Add(new RemoveLayerOperation(layer.Id));
+        }
+
+        if (operations.Count == 0) return;
+
         _applyingRemote = true;
         try
         {
-            // Replace the contents in one step so a joining participant sees a single change rather than a flood.
-            using (_document.BeginBatch("Synchronize", ChangeOrigin.Remote))
-            {
-                foreach (Layer layer in _document.Layers.ToArray())
-                {
-                    foreach (InkElement element in layer.Elements.ToArray()) _document.Apply(new RemoveElementOperation(element.Id), ChangeOrigin.Remote);
-                }
-                foreach (Layer layer in incoming.Layers)
-                {
-                    Guid target = _document.TryGetLayer(layer.Id, out _) ? layer.Id : Guid.Empty;
-                    if (target == Guid.Empty)
-                    {
-                        _document.Apply(new AddLayerOperation(layer.Id, layer.Properties, null, layer.Elements.ToArray()), ChangeOrigin.Remote);
-                        continue;
-                    }
-                    _document.Apply(new UpdateLayerOperation(layer.Id, layer.Properties), ChangeOrigin.Remote);
-                    foreach (InkElement element in layer.Elements) _document.Apply(new AddElementOperation(layer.Id, element), ChangeOrigin.Remote);
-                }
-            }
+            // A batch rolls back on failure, so a snapshot either lands completely or not at all.
+            _document.Apply(new BatchOperation(operations, "Synchronize"), ChangeOrigin.Remote);
+        }
+        catch (InvalidOperationException ex)
+        {
+            RemoteOperationRejected?.Invoke("The received document could not be applied: " + ex.Message);
         }
         finally
         {

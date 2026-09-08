@@ -22,6 +22,10 @@ public sealed class PanTool : ToolBase
     /// <inheritdoc />
     public override string Cursor => "grab";
 
+    /// <inheritdoc />
+    /// <remarks>Panning and zooming change only the viewport, so this tool works on a read-only canvas.</remarks>
+    public override bool ModifiesDocument => false;
+
     /// <summary>Minimum zoom.</summary>
     public float MinZoom { get; set; } = 0.05f;
 

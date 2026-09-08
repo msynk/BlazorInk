@@ -31,6 +31,7 @@ public sealed class ShapeTool : ToolBase
     private Vector2 _start;
     private Vector2 _current;
     private bool _constrain;
+    private Guid _targetLayerId;
 
     /// <summary>Creates a shape tool.</summary>
     /// <param name="kind">Which shape to draw.</param>
@@ -62,6 +63,8 @@ public sealed class ShapeTool : ToolBase
         if (context.Document.TryGetLayer(context.ActiveLayerId, out Layer? layer) && (layer.IsLocked || !layer.IsVisible)) return false;
         _dragging = true;
         _pointerId = sample.PointerId;
+        // The shape belongs to the layer the gesture started on, even if the active layer changes meanwhile.
+        _targetLayerId = context.ActiveLayerId;
         _start = context.Viewport.ToDocument(sample.Position);
         _current = _start;
         _constrain = sample.Shift;
@@ -94,9 +97,16 @@ public sealed class ShapeTool : ToolBase
         InkElement? element = Build(context);
         if (element is not null)
         {
-            context.Document.AddElement(element, context.ActiveLayerId);
-            context.InvalidateDocument(element.Bounds);
-            context.Announce($"{element.TypeName} added.");
+            try
+            {
+                context.Document.AddElement(element, _targetLayerId);
+                context.InvalidateDocument(element.Bounds);
+                context.Announce($"{element.TypeName} added.");
+            }
+            catch (InvalidOperationException ex)
+            {
+                context.Announce("That shape could not be added: " + ex.Message);
+            }
         }
         context.InvalidateOverlay();
     }
@@ -110,6 +120,15 @@ public sealed class ShapeTool : ToolBase
         _dragging = false;
         _pointerId = -1;
         context.InvalidateOverlay();
+    }
+
+    /// <inheritdoc />
+    public override void Deactivate(IToolContext context)
+    {
+        if (!_dragging) return;
+        _dragging = false;
+        _pointerId = -1;
+        context?.InvalidateOverlay();
     }
 
     private (Vector2 Start, Vector2 End) GetPoints()

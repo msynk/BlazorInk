@@ -43,6 +43,7 @@ public sealed class EraserTool : DrawTool
     private bool _erasing;
     private int _pointerId = -1;
     private Vector2 _lastPosition;
+    private EraserMode _activeMode;
 
     /// <inheritdoc />
     public override string Id => "eraser";
@@ -73,7 +74,10 @@ public sealed class EraserTool : DrawTool
     public override bool OnPointerDown(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (Mode == EraserMode.Pixel) return base.OnPointerDown(context, sample);
+        // The mode is fixed for the whole gesture: switching it half way through would route the release to a
+        // different code path and leave the history group open, which would disable undo.
+        _activeMode = Mode;
+        if (_activeMode == EraserMode.Pixel) return base.OnPointerDown(context, sample);
 
         if (_erasing) return false;
         _erasing = true;
@@ -94,7 +98,7 @@ public sealed class EraserTool : DrawTool
     public override void OnPointerMove(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (Mode == EraserMode.Pixel) { base.OnPointerMove(context, sample); return; }
+        if (_activeMode == EraserMode.Pixel) { base.OnPointerMove(context, sample); return; }
         if (!_erasing || sample.PointerId != _pointerId) return;
         Vector2 p = context.Viewport.ToDocument(sample.Position);
         // Keep the swept path short: only the newest segment is needed for each erase pass.
@@ -110,7 +114,7 @@ public sealed class EraserTool : DrawTool
     public override void OnPointerUp(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (Mode == EraserMode.Pixel) { base.OnPointerUp(context, sample); return; }
+        if (_activeMode == EraserMode.Pixel) { base.OnPointerUp(context, sample); return; }
         if (!_erasing || sample.PointerId != _pointerId) return;
         context.ReleasePointer(sample.PointerId);
         EndGesture(context);
@@ -120,7 +124,7 @@ public sealed class EraserTool : DrawTool
     public override void OnPointerCancel(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (Mode == EraserMode.Pixel) { base.OnPointerCancel(context, sample); return; }
+        if (_activeMode == EraserMode.Pixel) { base.OnPointerCancel(context, sample); return; }
         if (!_erasing) return;
         context.ReleasePointer(sample.PointerId);
         EndGesture(context);
@@ -142,6 +146,9 @@ public sealed class EraserTool : DrawTool
     public override void Deactivate(IToolContext context)
     {
         if (_erasing) EndGesture(context);
+        // Always release the history group, even if the gesture flag was already cleared by an earlier path.
+        _historyGroup?.Dispose();
+        _historyGroup = null;
         base.Deactivate(context);
     }
 
@@ -163,7 +170,7 @@ public sealed class EraserTool : DrawTool
                 InkElement element = elements[i];
                 if (!element.Bounds.Intersects(area)) continue;
 
-                if (element is Stroke stroke && Mode == EraserMode.Segment)
+                if (element is Stroke stroke && _activeMode == EraserMode.Segment)
                 {
                     if (!StrokeEditor.EraseSegments(stroke, segment, Radius, _fragments)) continue;
                     if (_fragments.Count == 0)
@@ -186,7 +193,17 @@ public sealed class EraserTool : DrawTool
         }
 
         if (operations.Count == 0) return;
-        document.Apply(operations.Count == 1 ? operations[0] : new BatchOperation(operations, "Erase"));
+        try
+        {
+            document.Apply(operations.Count == 1 ? operations[0] : new BatchOperation(operations, "Erase"));
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Segment erasing can split a stroke into more elements than the document allows. Report it and let
+            // the gesture end cleanly rather than unwinding through the browser callback.
+            context.Announce("Erasing was refused: " + ex.Message);
+            return;
+        }
         context.InvalidateDocument(area);
     }
 
@@ -216,7 +233,7 @@ public sealed class EraserTool : DrawTool
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(render);
-        if (Mode == EraserMode.Pixel)
+        if (_activeMode == EraserMode.Pixel)
         {
             base.DrawOverlay(context, render);
             return;

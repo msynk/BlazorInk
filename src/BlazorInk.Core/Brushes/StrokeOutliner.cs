@@ -119,6 +119,15 @@ public static class StrokeOutliner
             prevDir = GeometryMath.SafeNormalize(points.PositionAt(j) - prev);
             if (prevDir != Vector2.Zero) break;
         }
+        if (prevDir == Vector2.Zero)
+        {
+            // Every step is below the epsilon used to derive a direction, yet the points span enough distance to
+            // get here. Without a direction the outline would collapse, so draw the stroke as a dot instead.
+            float r = MathF.Max(halfWidth * curve.Apply(points.Pressure[0]), halfWidth * 0.35f);
+            AddArc(polygon, points.PositionAt(0), r, 0f, MathF.PI * 2f, 16, includeEnd: false);
+            return;
+        }
+
         Vector2 startDir = prevDir;
         Vector2 endDir = prevDir;
         float startRadius = 0f, endRadius = 0f;

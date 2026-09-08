@@ -201,6 +201,11 @@ public sealed class InkDocument
     /// Groups all operations applied until the returned scope is disposed into a single <see cref="BatchOperation"/>
     /// that raises one <see cref="Changed"/> event and undoes as one step. Scopes nest.
     /// </summary>
+    /// <remarks>
+    /// A scope collects operations that have already been applied, so an exception thrown inside it leaves the
+    /// operations that succeeded in place. This differs from applying a <see cref="BatchOperation"/> directly,
+    /// which rolls back on failure. Use the batch operation when the change must be all or nothing.
+    /// </remarks>
     /// <param name="label">Label for the batch (used by history UIs).</param>
     /// <param name="origin">Origin reported for the batch.</param>
     public IDisposable BeginBatch(string? label = null, ChangeOrigin origin = ChangeOrigin.Local)
@@ -256,7 +261,12 @@ public sealed class InkDocument
     {
         ArgumentNullException.ThrowIfNull(elementIds);
         var ops = new List<DrawingOperation>();
-        foreach (Guid id in elementIds) if (ContainsElement(id)) ops.Add(new RemoveElementOperation(id));
+        var seen = new HashSet<Guid>();
+        // A repeated id would remove the element and then fail on the second attempt, rolling the batch back.
+        foreach (Guid id in elementIds)
+        {
+            if (ContainsElement(id) && seen.Add(id)) ops.Add(new RemoveElementOperation(id));
+        }
         if (ops.Count > 0) Apply(new BatchOperation(ops, "Delete"));
     }
 
@@ -345,13 +355,25 @@ public sealed class InkDocument
     internal InkElement ReplaceElementCore(InkElement element)
     {
         if (!_elementLayers.TryGetValue(element.Id, out Layer? layer)) throw new InvalidOperationException($"Element {element.Id} is not in the document.");
-        ValidateElement(element);
         int index = layer.IndexOf(element.Id);
         InkElement previous = layer.Elements[index];
+
+        // The outgoing element's points no longer count towards the total, so remove them before validating.
+        // Otherwise replacing a stroke with one of the same size could falsely trip the document's point limit.
+        if (previous is Stroke outgoing) _totalPoints -= outgoing.Points.Count;
+        try
+        {
+            ValidateElement(element);
+        }
+        catch
+        {
+            if (previous is Stroke restore) _totalPoints += restore.Points.Count;
+            throw;
+        }
+
         InkElement next = element.Version > previous.Version ? element : element with { Version = previous.Version + 1 };
         layer.MutableElements[index] = next;
-        if (previous is Stroke ps) _totalPoints -= ps.Points.Count;
-        if (next is Stroke ns) _totalPoints += ns.Points.Count;
+        if (next is Stroke incoming) _totalPoints += incoming.Points.Count;
         return previous;
     }
 

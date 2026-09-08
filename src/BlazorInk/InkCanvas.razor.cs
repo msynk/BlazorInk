@@ -68,6 +68,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private string _cursor = "crosshair";
     private ITool? _previousToolParameter;
     private InkDocument? _previousDocumentParameter;
+    private Viewport _previousViewportParameter = Viewport.Identity;
     private TextEditorState? _textEditor;
     private Stroke? _lastAddedStroke;
     private bool _watchForAddedStroke;
@@ -269,7 +270,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     {
         if (ReadOnly || _selection.IsEmpty) return;
         int count = _selection.Count;
-        _document.RemoveElements(_selection.Ids.ToArray());
+        _document.RemoveElements(_selection.Ids);
         Announce($"Deleted {count} elements.");
         InvalidateAll();
     }
@@ -307,13 +308,22 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     /// <summary>Zooms around the center of the view.</summary>
     public void ZoomBy(float factor) => SetViewport(_viewport.ZoomBy(factor, ViewSize / 2f));
 
-    /// <summary>Exports the drawing as SVG.</summary>
-    public Task<string> ExportSvgAsync(SvgExportOptions? options = null)
-        => Task.FromResult(SvgExporter.Export(_document, ApplySelection(options ?? SvgExportOptions.Default)));
+    /// <summary>
+    /// Exports the drawing as SVG. This is synchronous work: SVG generation happens entirely in .NET and needs
+    /// nothing from the browser.
+    /// </summary>
+    public string ExportSvg(SvgExportOptions? options = null)
+        => SvgExporter.Export(_document, ApplySelection(options ?? SvgExportOptions.Default));
+
+    /// <summary>
+    /// Exports the drawing as SVG. Provided for symmetry with <see cref="ExportPngAsync"/>; the work itself is
+    /// synchronous, so <see cref="ExportSvg"/> is equivalent and avoids a needless state machine.
+    /// </summary>
+    public Task<string> ExportSvgAsync(SvgExportOptions? options = null) => Task.FromResult(ExportSvg(options));
 
     private SvgExportOptions ApplySelection(SvgExportOptions options)
         => options.Region == ExportRegion.Selection && options.SelectedIds is null
-            ? options with { SelectedIds = _selection.Ids.ToArray() }
+            ? options with { SelectedIds = _selection.Ids }
             : options;
 
     /// <summary>
@@ -342,7 +352,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         {
             ClipBounds = region,
             IncludeHiddenLayers = options.IncludeHiddenLayers,
-            ElementFilter = options.Region == ExportRegion.Selection && options.SelectedIds is null ? _selection.Ids.ToArray() : options.SelectedIds,
+            ElementFilter = options.Region == ExportRegion.Selection && options.SelectedIds is null ? _selection.Ids : options.SelectedIds,
         });
 
         await EnsureImagesLoadedAsync(cancellationToken).ConfigureAwait(false);
@@ -360,17 +370,36 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     }
 
     /// <summary>Exports the drawing as a PNG and offers it to the user as a file download.</summary>
+    /// <exception cref="InvalidOperationException">The browser layer is not available, so nothing can be downloaded.</exception>
     public async Task SavePngAsync(string fileName = "drawing.png", PngExportOptions? options = null, CancellationToken cancellationToken = default)
     {
+        RequireBrowser();
         byte[] bytes = await ExportPngAsync(options, cancellationToken).ConfigureAwait(false);
-        if (_interop is not null && bytes.Length > 0) await _interop.SaveFileAsync(fileName, bytes, "image/png").ConfigureAwait(false);
+        if (bytes.Length > 0) await _interop!.SaveFileAsync(fileName, bytes, "image/png").ConfigureAwait(false);
     }
 
     /// <summary>Exports the drawing as SVG and offers it to the user as a file download.</summary>
+    /// <exception cref="InvalidOperationException">The browser layer is not available, so nothing can be downloaded.</exception>
     public async Task SaveSvgAsync(string fileName = "drawing.svg", SvgExportOptions? options = null)
     {
-        string svg = await ExportSvgAsync((options ?? SvgExportOptions.Default) with { IncludeXmlDeclaration = true }).ConfigureAwait(false);
-        if (_interop is not null) await _interop.SaveFileAsync(fileName, System.Text.Encoding.UTF8.GetBytes(svg), "image/svg+xml").ConfigureAwait(false);
+        RequireBrowser();
+        string svg = ExportSvg((options ?? SvgExportOptions.Default) with { IncludeXmlDeclaration = true });
+        await _interop!.SaveFileAsync(fileName, System.Text.Encoding.UTF8.GetBytes(svg), "image/svg+xml").ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Throws when the browser layer is unavailable. Downloading is the one operation that cannot degrade
+    /// quietly: silently doing nothing would look to the user like a broken button.
+    /// </summary>
+    private void RequireBrowser()
+    {
+        if (_interop is null || _disposed)
+        {
+            throw new InvalidOperationException(
+                AttachFailed is { } reason
+                    ? "The canvas could not attach to the browser, so the file cannot be saved: " + reason
+                    : "The canvas is not attached to a browser yet. Wait for the Ready event before saving a file.");
+        }
     }
 
     /// <summary>Adds an image to the document, sized to its natural dimensions.</summary>
@@ -437,7 +466,12 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if (Document is not null && !ReferenceEquals(Document, _previousDocumentParameter))
         {
             _previousDocumentParameter = Document;
-            if (!ReferenceEquals(Document, _document)) AttachDocument(Document);
+            if (!ReferenceEquals(Document, _document))
+            {
+                // A gesture in flight refers to the old document's elements and history; finish it first.
+                CancelActiveGesture();
+                AttachDocument(Document);
+            }
             InvalidateAll();
         }
 
@@ -450,10 +484,16 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if (Brush is not null && !Equals(Brush, _brush)) _brush = Brush;
         if (ShapeStyle is not null) _shapeStyle = ShapeStyle;
         if (ActiveLayerId is { } layerId && _document.TryGetLayer(layerId, out _)) _activeLayerId = layerId;
-        if (Viewport != _viewport && Viewport != default)
+        // Only follow the parameter when the parent actually changed it. Comparing against the current viewport
+        // instead would revert the user's own panning every time the parent re-rendered.
+        if (Viewport != _previousViewportParameter)
         {
-            _viewport = Viewport;
-            InvalidateAll();
+            _previousViewportParameter = Viewport;
+            if (Viewport != default && Viewport != _viewport)
+            {
+                _viewport = Viewport;
+                InvalidateAll();
+            }
         }
         if (_history.Limit != HistoryLimit) _history.Limit = HistoryLimit;
     }
@@ -508,8 +548,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             _attached = true;
 
             await _interop.SetSizeAsync(_cssWidth, _cssHeight, _devicePixelRatio).ConfigureAwait(false);
+            if (_disposed) return;
             await _interop.SetCursorAsync(_cursor).ConfigureAwait(false);
             await UpdateWetInkStyleAsync().ConfigureAwait(false);
+            if (_disposed) return;
             InvalidateAll();
             await RenderDirtyAsync().ConfigureAwait(false);
 
@@ -531,6 +573,20 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             AttachFailed = ex.Message;
             _capabilities = InputCapabilities.None;
         }
+    }
+
+    /// <summary>
+    /// Ends whatever the active tool is doing, without committing it. Called whenever the canvas is about to
+    /// change underneath a gesture: a stranded gesture would hold pointer capture and an open history group,
+    /// which silently disables undo.
+    /// </summary>
+    private void CancelActiveGesture()
+    {
+        if (_activeTool is null) return;
+        _activeTool.Deactivate(_toolContext);
+        _activeTool.Activate(_toolContext);
+        _history?.EndOpenGroups();
+        _overlayDirty = true;
     }
 
     /// <summary>
@@ -638,7 +694,14 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
 
     void IInkInteropClient.OnSamples(ReadOnlySpan<double> data, int count)
     {
-        if (_disposed || ReadOnly) return;
+        if (_disposed) return;
+
+        // A read-only canvas still pans and zooms: only tools that change the document are blocked.
+        if (ReadOnly && _activeTool.ModifiesDocument)
+        {
+            CancelActiveGesture();
+            return;
+        }
         int stride = InputSample.PackedSize;
         bool wantsAll = _activeTool.WantsCoalescedInput;
 
@@ -1003,13 +1066,13 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if (_document.IsEmpty) return "Empty drawing canvas.";
 
         var described = new List<string>();
-        int total = 0;
+        int total = _document.ElementCount;
+        const int maxDescribed = 25;
         foreach (InkElement element in _document.AllElements)
         {
-            total++;
+            if (described.Count >= maxDescribed) break;
             if (element.Description is { Length: > 0 } description) described.Add(description);
             else if (element is TextElement text && text.Text.Length > 0) described.Add("Text: " + text.Text);
-            if (described.Count >= 25) break;
         }
 
         string summary = $"Drawing with {total} elements on {_document.Layers.Count} layers.";

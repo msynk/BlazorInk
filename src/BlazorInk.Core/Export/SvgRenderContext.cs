@@ -36,8 +36,27 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
     /// <inheritdoc />
     public bool SupportsImages => true;
 
-    /// <summary>Prefix for generated ids, so fragments from several documents can be combined without collisions.</summary>
-    public string IdPrefix { get; init; } = "bi";
+    /// <summary>
+    /// Prefix for generated ids, so fragments from several documents can be combined without collisions.
+    /// Restricted to characters that are safe inside an attribute value.
+    /// </summary>
+    public string IdPrefix
+    {
+        get => _idPrefix;
+        init => _idPrefix = IsSafeIdPrefix(value) ? value : "bi";
+    }
+
+    private readonly string _idPrefix = "bi";
+
+    private static bool IsSafeIdPrefix(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 96 || !char.IsAsciiLetter(value[0])) return false;
+        foreach (char c in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_') return false;
+        }
+        return true;
+    }
 
     /// <inheritdoc />
     public void Save() => _closeTags.Push(string.Empty);

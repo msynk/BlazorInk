@@ -102,8 +102,27 @@ public sealed record SvgExportOptions : ExportOptions
     /// </summary>
     public bool IncludeElementDescriptions { get; init; }
 
-    /// <summary>Prefix for generated element ids.</summary>
-    public string IdPrefix { get; init; } = "bi";
+    /// <summary>
+    /// Prefix for generated element ids. Restricted to letters, digits, hyphen and underscore, because the value
+    /// is written into an <c>id</c> attribute; anything else falls back to the default.
+    /// </summary>
+    public string IdPrefix
+    {
+        get => _idPrefix;
+        init => _idPrefix = IsSafeIdPrefix(value) ? value : "bi";
+    }
+
+    private readonly string _idPrefix = "bi";
+
+    private static bool IsSafeIdPrefix(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.Length > 64 || !char.IsAsciiLetter(value[0])) return false;
+        foreach (char c in value)
+        {
+            if (!char.IsAsciiLetterOrDigit(c) && c != '-' && c != '_') return false;
+        }
+        return true;
+    }
 
     /// <summary>Scale factor applied through the <c>width</c>/<c>height</c> attributes; the view box is unchanged.</summary>
     public float Scale { get; init; } = 1f;
@@ -259,25 +278,59 @@ public static class SvgExporter
     }
 
     /// <summary>
-    /// Writes the first <paramref name="count"/> elements of a layer. Eraser strokes become masks that apply to
-    /// everything drawn before them, which is exactly the sequential destination-out semantics used on canvas.
+    /// Writes a layer's elements. Eraser strokes become masks that apply to everything drawn before them, which
+    /// is exactly the sequential destination-out semantics used on canvas.
     /// </summary>
+    /// <remarks>
+    /// Nesting is built iteratively. A recursive formulation would nest once per eraser stroke, and a document
+    /// can contain hundreds of thousands of those, which would overflow the stack in a way .NET cannot catch.
+    /// </remarks>
     private static void WriteRun(TextWriter writer, SvgRenderContext context, List<InkElement> elements, int count, ExportState state)
     {
-        int lastEraser = -1;
-        for (int i = count - 1; i >= 0; i--)
+        // Find the eraser positions once, then open one group per eraser from the outside in.
+        var erasers = new List<int>();
+        for (int i = 0; i < count; i++)
         {
-            if (elements[i] is Stroke { IsEraser: true }) { lastEraser = i; break; }
+            if (elements[i] is Stroke { IsEraser: true }) erasers.Add(i);
         }
 
-        if (lastEraser < 0)
+        if (erasers.Count == 0)
         {
             for (int i = 0; i < count; i++) WriteElement(writer, context, elements[i], state);
             return;
         }
 
-        var eraser = (Stroke)elements[lastEraser];
-        string maskId = state.Options.IdPrefix + "-mask-" + state.MaskCounter++.ToString(CultureInfo.InvariantCulture);
+        // Beyond this depth the nesting itself becomes the problem; flattening loses the erasing but keeps the
+        // file valid and finite. Reaching it needs a pathological document, not a real drawing.
+        const int maxNesting = 256;
+        if (erasers.Count > maxNesting)
+        {
+            for (int i = 0; i < count; i++) WriteElement(writer, context, elements[i], state);
+            return;
+        }
+
+        for (int e = erasers.Count - 1; e >= 0; e--)
+        {
+            WriteMask(writer, (Stroke)elements[erasers[e]], state, out string maskId);
+            writer.Write("<g mask=\"url(#");
+            writer.Write(maskId);
+            writer.Write(")\">");
+        }
+
+        // Innermost first: everything before the first eraser, then each run between erasers as a group closes.
+        for (int i = 0; i < erasers[0]; i++) WriteElement(writer, context, elements[i], state);
+        for (int e = 0; e < erasers.Count; e++)
+        {
+            writer.Write("</g>");
+            int from = erasers[e] + 1;
+            int to = e + 1 < erasers.Count ? erasers[e + 1] : count;
+            for (int i = from; i < to; i++) WriteElement(writer, context, elements[i], state);
+        }
+    }
+
+    private static void WriteMask(TextWriter writer, Stroke eraser, ExportState state, out string maskId)
+    {
+        maskId = state.Options.IdPrefix + "-mask-" + state.MaskCounter++.ToString(CultureInfo.InvariantCulture);
 
         writer.Write("<mask id=\"");
         writer.Write(maskId);
@@ -306,14 +359,6 @@ public static class SvgExporter
         StrokeGeometryToMask(maskContext, eraser);
         maskContext.Restore();
         writer.Write("</mask>");
-
-        writer.Write("<g mask=\"url(#");
-        writer.Write(maskId);
-        writer.Write(")\">");
-        WriteRun(writer, context, elements, lastEraser, state);
-        writer.Write("</g>");
-
-        for (int i = lastEraser + 1; i < count; i++) WriteElement(writer, context, elements[i], state);
     }
 
     private static void StrokeGeometryToMask(SvgRenderContext context, Stroke eraser)

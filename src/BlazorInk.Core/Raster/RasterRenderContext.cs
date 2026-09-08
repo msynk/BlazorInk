@@ -218,8 +218,10 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
             {
                 result = PngCodec.Decode(bytes);
             }
-            catch (FormatException)
+            catch (Exception ex) when (ex is FormatException or InvalidDataException or ArgumentException or OutOfMemoryException)
             {
+                // A document may embed any bytes at all. An undecodable image is reported through SkippedImages,
+                // never by aborting the export.
                 result = null;
             }
         }

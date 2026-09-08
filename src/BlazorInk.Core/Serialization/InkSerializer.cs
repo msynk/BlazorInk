@@ -581,7 +581,16 @@ public static class InkSerializer
                 elements.Add(parsed);
             }
         }
-        document.InsertLayerCore(id, properties, null, elements);
+        try
+        {
+            document.InsertLayerCore(id, properties, null, elements);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Document limits and validation throw; to a caller loading a file this is a malformed document,
+            // which is what TryDeserialize promises to report rather than throw.
+            throw new InkFormatException(ex.Message, ex);
+        }
     }
 
     private static InkElement? ReadElement(JsonElement element, InkDeserializerOptions options)
@@ -597,7 +606,7 @@ public static class InkSerializer
             "line" => ReadLine(element),
             "text" => ReadText(element),
             "image" => ReadImage(element, options),
-            "highlight" => ReadHighlight(element),
+            "highlight" => ReadHighlight(element, options.Limits),
             "callout" => ReadCallout(element),
             _ => options.PreserveUnknownElements ? new UnknownElement(type, element.GetRawText(), ReadRect(element, "bounds") ?? Rect.Empty) : null,
         };
@@ -824,11 +833,19 @@ public static class InkSerializer
         };
     }
 
-    private static HighlightElement ReadHighlight(JsonElement element)
+    private static HighlightElement ReadHighlight(JsonElement element, DocumentLimits limits)
     {
         var rects = new List<Rect>();
         if (element.TryGetProperty("rects", out JsonElement array) && array.ValueKind == JsonValueKind.Array)
         {
+            // A highlight is a list of rectangles, so it needs its own bound: without one it would be the only
+            // element type that can grow without limit.
+            int maxRects = Math.Max(limits.MaxPointsPerStroke / 4, 64);
+            if (array.GetArrayLength() > maxRects)
+            {
+                throw new InkFormatException($"A highlight declares {array.GetArrayLength()} rectangles; the limit is {maxRects}.");
+            }
+
             Span<float> values = stackalloc float[4];
             foreach (JsonElement r in array.EnumerateArray())
             {
@@ -837,7 +854,7 @@ public static class InkSerializer
                 foreach (JsonElement value in r.EnumerateArray())
                 {
                     if (i >= 4) break;
-                    values[i++] = value.TryGetSingle(out float f) ? f : 0f;
+                    values[i++] = value.TryGetSingle(out float f) && float.IsFinite(f) ? f : 0f;
                 }
                 if (i == 4) rects.Add(new Rect(values[0], values[1], values[2], values[3]));
             }

@@ -86,9 +86,12 @@ public readonly record struct Rect(float X, float Y, float Width, float Height)
         return r <= l || b <= t ? Empty : FromLTRB(l, t, r, b);
     }
 
-    /// <summary>True when the rectangles overlap (touching edges count as overlapping).</summary>
+    /// <summary>
+    /// True when the rectangles overlap, with touching edges counting as overlapping. A zero-area rectangle is a
+    /// point or a line, which can still overlap: only the <see cref="Empty"/> sentinel intersects nothing.
+    /// </summary>
     public bool Intersects(Rect other)
-        => !IsEmpty && !other.IsEmpty && other.Left <= Right && other.Right >= Left && other.Top <= Bottom && other.Bottom >= Top;
+        => !IsUnset && !other.IsUnset && other.Left <= Right && other.Right >= Left && other.Top <= Bottom && other.Bottom >= Top;
 
     /// <summary>True when the point lies inside or on the edge.</summary>
     public bool Contains(Vector2 point)

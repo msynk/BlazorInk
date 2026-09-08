@@ -124,14 +124,28 @@ internal sealed class InkInterop : IAsyncDisposable
     /// <summary>Loads the module, attaches to the element and returns the browser's capabilities.</summary>
     public async Task<AttachResult?> AttachAsync(ElementReference element, InteropOptions options, CancellationToken cancellationToken = default)
     {
-        _module = await _jsRuntime.InvokeAsync<IJSObjectReference>("import", cancellationToken, ModulePath).ConfigureAwait(false);
-        if (_module is null) return null;
+        // The module reference is held in a local across every await. Disposal can run at any of these points and
+        // clears the field; resuming on a null field would throw a NullReferenceException nothing catches.
+        IJSObjectReference module = await _jsRuntime.InvokeAsync<IJSObjectReference>("import", cancellationToken, ModulePath).ConfigureAwait(false);
+        if (module is null) return null;
+        if (_disposed)
+        {
+            await DisposeModuleAsync(module).ConfigureAwait(false);
+            return null;
+        }
+        _module = module;
 
-        AttachResult? result = await _module.InvokeAsync<AttachResult?>("attach", cancellationToken, _id, element, options).ConfigureAwait(false);
-        if (result is null) return null;
+        AttachResult? result = await module.InvokeAsync<AttachResult?>("attach", cancellationToken, _id, element, options).ConfigureAwait(false);
+        if (result is null || _disposed) return null;
 
-        _callbacks = DotNetObjectReference.Create(new InteropCallbacks(_client));
-        await _module.InvokeVoidAsync("setDotNetCallbacks", cancellationToken, _id, _callbacks).ConfigureAwait(false);
+        var callbacks = DotNetObjectReference.Create(new InteropCallbacks(_client));
+        await module.InvokeVoidAsync("setDotNetCallbacks", cancellationToken, _id, callbacks).ConfigureAwait(false);
+        if (_disposed)
+        {
+            callbacks.Dispose();
+            return null;
+        }
+        _callbacks = callbacks;
 
         if (OperatingSystem.IsBrowser())
         {
@@ -141,6 +155,20 @@ internal sealed class InkInterop : IAsyncDisposable
             _useWasmFastPath = await WasmRenderBridge.TryInitializeAsync(ResolveModuleUrl()).ConfigureAwait(false);
         }
         return result;
+    }
+
+    private static async ValueTask DisposeModuleAsync(IJSObjectReference module)
+    {
+        try
+        {
+            await module.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
     }
 
     private string ResolveModuleUrl()

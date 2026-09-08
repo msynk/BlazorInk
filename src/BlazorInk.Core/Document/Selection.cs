@@ -22,8 +22,11 @@ public sealed class Selection : IDisposable
         document.Changed += OnDocumentChanged;
     }
 
-    /// <summary>Selected ids in selection order.</summary>
-    public IReadOnlyList<Guid> Ids => _ids;
+    /// <summary>
+    /// Selected ids in selection order, as a snapshot. A copy is returned because the obvious use is to iterate
+    /// while deleting, and the selection updates itself as the document changes.
+    /// </summary>
+    public IReadOnlyList<Guid> Ids => _ids.ToArray();
 
     /// <summary>Number of selected elements.</summary>
     public int Count => _ids.Count;
@@ -39,7 +42,11 @@ public sealed class Selection : IDisposable
     {
         get
         {
-            foreach (Guid id in _ids) if (_document.TryGetElement(id, out InkElement? e)) yield return e;
+            // Iterating a copy, for the same reason as Ids: callers routinely edit the document while iterating.
+            foreach (Guid id in _ids.ToArray())
+            {
+                if (_document.TryGetElement(id, out InkElement? e)) yield return e;
+            }
         }
     }
 

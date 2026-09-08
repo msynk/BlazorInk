@@ -90,7 +90,7 @@ public sealed class SelectTool : ToolBase
         _startDocument = doc;
         _currentDocument = doc;
         _pointerId = sample.PointerId;
-        _addToSelection = sample.IsSecondaryButton;
+        _addToSelection = sample.Shift || sample.Ctrl || sample.IsSecondaryButton;
         _movedPastThreshold = false;
 
         Selection selection = context.Selection;
@@ -198,7 +198,23 @@ public sealed class SelectTool : ToolBase
         ArgumentNullException.ThrowIfNull(context);
         if (_drag == DragKind.None) return;
         context.ReleasePointer(sample.PointerId);
+        Cancel(context);
+    }
+
+    /// <inheritdoc />
+    public override void Deactivate(IToolContext context)
+    {
+        // Being swapped out mid-drag must not leave the history group open: that would disable undo entirely.
+        if (_drag != DragKind.None) Cancel(context);
+    }
+
+    /// <summary>Restores the original transforms and ends the gesture, leaving no history step behind.</summary>
+    private void Cancel(IToolContext context)
+    {
+        // The restore is collected into the same group as the move, and the group is then discarded: a cancelled
+        // drag should leave the document unchanged and the undo stack untouched.
         RestoreTransforms(context);
+        context.History.CancelGroup();
         Finish(context);
     }
 
@@ -222,7 +238,15 @@ public sealed class SelectTool : ToolBase
         {
             if (_startTransforms.TryGetValue(e.Id, out Matrix3x2 original) && e.Transform != original) _pending.Add(e with { Transform = original });
         }
-        if (_pending.Count > 0) context.Document.ReplaceElements(_pending, "Cancel");
+        if (_pending.Count == 0) return;
+        try
+        {
+            context.Document.ReplaceElements(_pending, "Cancel");
+        }
+        catch (InvalidOperationException)
+        {
+            // Nothing useful to do: the elements are already where the document will allow them.
+        }
     }
 
     private Matrix3x2 BuildResize(Vector2 delta, bool shift)
@@ -289,7 +313,19 @@ public sealed class SelectTool : ToolBase
             _pending.Add(e with { Transform = original * matrix });
         }
         if (_pending.Count == 0) return;
-        context.Document.ReplaceElements(_pending, _drag == DragKind.Rotate ? "Rotate" : _drag == DragKind.Resize ? "Resize" : "Move");
+
+        string label = _drag == DragKind.Rotate ? "Rotate" : _drag == DragKind.Resize ? "Resize" : "Move";
+        try
+        {
+            context.Document.ReplaceElements(_pending, label);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Dragging an element past the document's coordinate limit is refused. Reporting it and carrying on
+            // is right; letting it escape would unwind through the browser callback and strand the gesture.
+            context.Announce("That move was refused: " + ex.Message);
+            return;
+        }
         context.InvalidateDocument();
         context.InvalidateOverlay();
     }
@@ -385,16 +421,18 @@ public sealed class SelectTool : ToolBase
         switch (key.Key)
         {
             case "Escape":
-                if (_drag != DragKind.None) { RestoreTransforms(context); Finish(context); return true; }
+                if (_drag != DragKind.None) { Cancel(context); return true; }
                 if (!selection.IsEmpty) { selection.Clear(); return true; }
                 return false;
             case "Delete":
             case "Backspace":
+            {
                 if (selection.IsEmpty) return false;
                 int n = selection.Count;
-                context.Document.RemoveElements(selection.Ids.ToArray());
+                context.Document.RemoveElements(selection.Ids);
                 context.Announce($"Deleted {n} elements.");
                 return true;
+            }
             case "ArrowLeft":
             case "ArrowRight":
             case "ArrowUp":
@@ -410,7 +448,15 @@ public sealed class SelectTool : ToolBase
                     _ => new Vector2(0, step),
                 };
                 var moved = selection.Elements.Select(e => e.Translate(delta)).ToList();
-                context.Document.ReplaceElements(moved, "Move");
+                try
+                {
+                    context.Document.ReplaceElements(moved, "Move");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    context.Announce("That move was refused: " + ex.Message);
+                    return true;
+                }
                 context.InvalidateDocument();
                 context.InvalidateOverlay();
                 return true;

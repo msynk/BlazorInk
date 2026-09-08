@@ -18,6 +18,7 @@ public class DrawTool : ToolBase
     private readonly StrokeBuilder _builder = new();
     private readonly PathBuilder _pathBuilder = new(512);
     private StrokeGeometry? _liveGeometry;
+    private Guid _targetLayerId;
     private int _lastGeometryCount = -1;
     private Rect _liveBounds = Rect.Empty;
 
@@ -39,6 +40,12 @@ public class DrawTool : ToolBase
     /// </summary>
     public float SimplifyTolerance { get; set; } = 0.12f;
 
+    /// <summary>
+    /// Pressure tolerance used when simplifying, as a fraction of the 0..1 pressure range. Simplification treats
+    /// pressure as its own channel so a straight stroke drawn with changing pressure keeps its width variation.
+    /// </summary>
+    public float SimplifyPressureTolerance { get; set; } = 0.04f;
+
     /// <summary>Whether a pen's eraser button switches this tool to erasing for the duration of the stroke.</summary>
     public bool HonorPenEraserButton { get; set; } = true;
 
@@ -54,6 +61,7 @@ public class DrawTool : ToolBase
 
         Brush brush = SelectBrush(context, sample);
         ActiveBrush = brush;
+        _targetLayerId = context.ActiveLayerId;
         _builder.Begin(sample, brush, context.Viewport.ViewToDocument);
         _liveGeometry = null;
         _lastGeometryCount = -1;
@@ -100,10 +108,37 @@ public class DrawTool : ToolBase
     protected virtual void CommitStroke(IToolContext context, StrokePoints points, Brush brush)
     {
         if (points.Count == 0) return;
-        StrokePoints final = SimplifyTolerance > 0 ? points.Simplify(SimplifyTolerance) : points;
+        StrokePoints final = SimplifyTolerance > 0 ? points.Simplify(SimplifyTolerance, SimplifyPressureTolerance) : points;
         var stroke = new Stroke(final, brush) { Input = _builder.InputInfo };
-        context.Document.AddElement(stroke, context.ActiveLayerId);
+
+        // The stroke belongs to the layer it started on. Re-reading the active layer here would silently move it
+        // if the layer changed, or was locked, while the pen was down.
+        Guid layerId = context.Document.TryGetLayer(_targetLayerId, out Layer? layer) && !layer.IsLocked && layer.IsVisible
+            ? _targetLayerId
+            : context.ActiveLayerId;
+
+        if (!TryApply(context, () => context.Document.AddElement(stroke, layerId))) return;
         context.InvalidateDocument(stroke.Bounds);
+    }
+
+    /// <summary>
+    /// Applies a document change, reporting a refusal instead of letting it escape. Document limits throw, and an
+    /// exception here would unwind through the browser callback and strand the gesture.
+    /// </summary>
+    protected static bool TryApply(IToolContext context, Action change)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(change);
+        try
+        {
+            change();
+            return true;
+        }
+        catch (InvalidOperationException ex)
+        {
+            context.Announce("That change could not be applied: " + ex.Message);
+            return false;
+        }
     }
 
     /// <inheritdoc />
@@ -117,6 +152,22 @@ public class DrawTool : ToolBase
         _liveGeometry = null;
         _lastGeometryCount = -1;
         context.InvalidateOverlay();
+    }
+
+    /// <inheritdoc />
+    public override void Deactivate(IToolContext context)
+    {
+        // A tool that is swapped out mid-stroke must not leave a live builder behind: the next activation would
+        // resume a stroke the user abandoned, and the overlay would keep showing it.
+        if (_builder.IsActive)
+        {
+            if (_builder.PointerId >= 0) context?.ReleasePointer(_builder.PointerId);
+            _builder.Cancel();
+        }
+        ActiveBrush = null;
+        _liveGeometry = null;
+        _lastGeometryCount = -1;
+        context?.InvalidateOverlay();
     }
 
     /// <inheritdoc />

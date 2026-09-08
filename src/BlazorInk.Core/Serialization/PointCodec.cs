@@ -114,6 +114,12 @@ public static class PointCodec
         int n = (int)count;
         if (n == 0) return StrokePoints.Empty;
 
+        // Every point costs at least one byte per varint channel plus the fixed pressure byte, so a payload
+        // shorter than this cannot contain the declared count. Checking first stops a small hostile document
+        // from making the decoder allocate megabytes before it fails.
+        long minimumBytes = (long)n * 4 + offset;
+        if (data.Length < minimumBytes) throw new FormatException($"Point data declares {n} points but is only {data.Length} bytes.");
+
         float scale = 1f / quantization;
         float[] xs = new float[n], ys = new float[n], ps = new float[n], ts = new float[n];
         ReadQuantizedDeltas(data, ref offset, xs, scale);

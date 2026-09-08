@@ -183,7 +183,9 @@ public static class PngCodec
         while (offset + 8 <= data.Length)
         {
             int length = BinaryPrimitives.ReadInt32BigEndian(data[offset..]);
-            if (length < 0 || offset + 12 + length > data.Length) throw new FormatException("PNG chunk length is invalid.");
+            // Computed in 64 bits: a hostile length near int.MaxValue would wrap in 32-bit arithmetic and slip
+            // past this guard, then read out of bounds.
+            if (length < 0 || (long)offset + 12 + length > data.Length) throw new FormatException("PNG chunk length is invalid.");
             ReadOnlySpan<byte> type = data.Slice(offset + 4, 4);
             ReadOnlySpan<byte> chunk = data.Slice(offset + 8, length);
             offset += 12 + length;
@@ -223,8 +225,9 @@ public static class PngCodec
         int stride = width * channels;
         byte[] raw = new byte[(stride + 1) * height];
         idat.Position = 0;
-        using (var inflate = new ZLibStream(idat, CompressionMode.Decompress))
+        try
         {
+            using var inflate = new ZLibStream(idat, CompressionMode.Decompress);
             int read = 0;
             while (read < raw.Length)
             {
@@ -233,6 +236,11 @@ public static class PngCodec
                 read += n;
             }
             if (read < raw.Length) throw new FormatException("PNG pixel data is truncated.");
+        }
+        catch (InvalidDataException ex)
+        {
+            // Corrupt compressed data must look like any other malformed image to callers.
+            throw new FormatException("PNG pixel data is not valid compressed data.", ex);
         }
 
         byte[] pixels = new byte[width * height * 4];

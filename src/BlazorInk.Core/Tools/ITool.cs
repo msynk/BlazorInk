@@ -39,13 +39,21 @@ public interface IToolContext
     /// <summary>Requests that the overlay (live stroke, selection handles, marquee) be redrawn on the next frame.</summary>
     void InvalidateOverlay();
 
-    /// <summary>Requests that a document region be redrawn (document coordinates). Pass null to redraw everything.</summary>
+    /// <summary>
+    /// Requests that the document surface be redrawn. The region is a hint: the canvas renderer redraws the
+    /// visible area as a whole, so passing one is never wrong but does not currently narrow the work.
+    /// </summary>
+    /// <param name="region">The changed area in document coordinates, or null for the whole document.</param>
     void InvalidateDocument(Rect? region = null);
 
-    /// <summary>Captures the pointer so the gesture continues outside the canvas. Called by tools that drag.</summary>
+    /// <summary>
+    /// Declares that the tool has taken the gesture and wants it to continue outside the canvas. The browser
+    /// layer already captures on contact, so on the canvas host this records intent rather than doing more work;
+    /// a different host may need it.
+    /// </summary>
     void CapturePointer(int pointerId);
 
-    /// <summary>Releases a captured pointer.</summary>
+    /// <summary>Releases a pointer taken with <see cref="CapturePointer"/>.</summary>
     void ReleasePointer(int pointerId);
 
     /// <summary>Reports a cursor hint (a CSS cursor value such as <c>crosshair</c> or <c>grabbing</c>).</summary>
@@ -81,10 +89,19 @@ public interface ITool
     /// </summary>
     bool WantsCoalescedInput { get; }
 
+    /// <summary>
+    /// Whether the tool changes the document. Tools that only move the viewport, such as panning and zooming,
+    /// return false and keep working on a read-only canvas.
+    /// </summary>
+    bool ModifiesDocument { get; }
+
     /// <summary>Called when the tool becomes active.</summary>
     void Activate(IToolContext context);
 
-    /// <summary>Called when the tool is replaced. Must finish or cancel any gesture in progress.</summary>
+    /// <summary>
+    /// Called when the tool is replaced. Implementations must cancel any gesture in progress and release every
+    /// resource it holds, in particular a history group: leaving one open would silently disable undo.
+    /// </summary>
     void Deactivate(IToolContext context);
 
     /// <summary>A pointer went down. Return true to take the gesture (the host then captures the pointer).</summary>
@@ -130,6 +147,9 @@ public abstract class ToolBase : ITool
 
     /// <inheritdoc />
     public virtual bool WantsCoalescedInput => false;
+
+    /// <inheritdoc />
+    public virtual bool ModifiesDocument => true;
 
     /// <inheritdoc />
     public virtual void Activate(IToolContext context) { }
