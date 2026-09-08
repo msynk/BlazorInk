@@ -1,0 +1,88 @@
+/* BlazorInk canvas layout.
+   The container stacks two canvases and a transparent input surface. Everything here is layout only:
+   applications style the surrounding UI themselves. */
+
+.blazorink-canvas {
+  position: relative;
+  display: block;
+  overflow: hidden;
+  /* Stops long-press menus, text selection and the tap highlight from interrupting drawing. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  background: transparent;
+}
+
+.blazorink-canvas:focus-visible {
+  outline: 2px solid Highlight;
+  outline-offset: 2px;
+}
+
+.blazorink-layer {
+  position: absolute;
+  inset: 0;
+  display: block;
+  pointer-events: none;
+}
+
+.blazorink-document {
+  z-index: 0;
+}
+
+.blazorink-overlay {
+  z-index: 1;
+}
+
+.blazorink-input {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  /* touch-action is set inline from the component so applications can allow page scrolling. */
+  cursor: inherit;
+}
+
+.blazorink-content {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.blazorink-content > * {
+  pointer-events: auto;
+}
+
+.blazorink-text-editor {
+  position: absolute;
+  z-index: 4;
+  margin: 0;
+  padding: 0;
+  border: 1px solid Highlight;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  overflow: hidden;
+  resize: none;
+  white-space: pre;
+  line-height: inherit;
+}
+
+.blazorink-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (forced-colors: active) {
+  .blazorink-canvas {
+    forced-color-adjust: none;
+  }
+}

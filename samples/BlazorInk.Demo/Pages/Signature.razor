@@ -1,0 +1,181 @@
+@page "/signature"
+@using BlazorInk.Export
+@using BlazorInk.Serialization
+
+<PageTitle>Signature</PageTitle>
+
+<h1>Signature</h1>
+<p class="page-intro">
+    A production signature field: capture, clear, undo, validate and export. The signature is stored as vector
+    ink, so it can be re-rendered at any size, embedded in a PDF as SVG, or rasterized at print resolution.
+</p>
+
+<div class="panel">
+    <div class="toolbar">
+        <div class="toolbar-group" role="group" aria-label="Ink colour">
+            <button type="button" class="swatch @(_color == "#0f172a" ? "active" : null)" style="background:#0f172a"
+                    aria-label="Black ink" @onclick='() => SetColor("#0f172a")'></button>
+            <button type="button" class="swatch @(_color == "#1d4ed8" ? "active" : null)" style="background:#1d4ed8"
+                    aria-label="Blue ink" @onclick='() => SetColor("#1d4ed8")'></button>
+        </div>
+        <div class="toolbar-separator"></div>
+        <label class="field">
+            Nib
+            <input type="range" min="2" max="8" step="0.5" value="@_width" aria-label="Nib width"
+                   @onchange="OnWidthChanged" />
+            <span style="min-width:3ch">@_width.ToString("0.#")</span>
+        </label>
+        <div class="toolbar-spacer"></div>
+        <button type="button" class="btn" disabled="@(!CanUndo)" @onclick="() => _canvas?.Undo()">Undo</button>
+        <button type="button" class="btn danger" disabled="@IsEmpty" @onclick="Clear">Clear</button>
+    </div>
+
+    @* A fixed aspect signing area with a baseline, the way a paper form has one. *@
+    <div style="position:relative">
+        <InkCanvas @ref="_canvas"
+                   Height="200px"
+                   Brush="_brush"
+                   AriaLabel="Sign here"
+                   StrokeCompleted="OnStrokeCompleted"
+                   DocumentChanged="OnDocumentChanged" />
+        <div aria-hidden="true"
+             style="position:absolute;left:24px;right:24px;bottom:44px;border-bottom:1px solid var(--border);pointer-events:none"></div>
+        <div aria-hidden="true"
+             style="position:absolute;left:24px;bottom:22px;color:var(--text-muted);font-size:0.8rem;pointer-events:none">
+            Sign above the line
+        </div>
+    </div>
+
+    <CanvasStatus Canvas="_canvas">
+        <span>Ink length <strong>@_inkLength.ToString("0")</strong> units</span>
+    </CanvasStatus>
+</div>
+
+<div class="toolbar" style="border:1px solid var(--border);border-top:none;border-radius:0 0 10px 10px">
+    <button type="button" class="btn primary" disabled="@(!IsValid)" @onclick="AcceptAsync">Accept signature</button>
+    <button type="button" class="btn" disabled="@IsEmpty" @onclick="DownloadSvgAsync">Download SVG</button>
+    <button type="button" class="btn" disabled="@IsEmpty" @onclick="DownloadPngAsync">Download PNG (3x)</button>
+    <div class="toolbar-spacer"></div>
+    <span class="field">@_message</span>
+</div>
+
+@if (_saved is not null)
+{
+    <h2>Stored signature</h2>
+    <p class="page-intro">
+        This is the document as it would be persisted. It is compact vector data, not an image: @_savedBytes bytes
+        for @_saved.ElementCount strokes.
+    </p>
+    <div class="split">
+        <div class="panel" style="padding:1rem">
+            <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:0.5rem">Re-rendered from the stored document</div>
+            @((MarkupString)_savedSvg)
+        </div>
+        <div class="panel" style="padding:1rem">
+            <div style="font-size:0.78rem;color:var(--text-muted);margin-bottom:0.5rem">Serialized document</div>
+            <pre class="output"><code>@_savedJson</code></pre>
+        </div>
+    </div>
+}
+
+@code {
+    private InkCanvas? _canvas;
+    private Brush _brush = new PenBrush { Width = 3.5f, Color = InkColor.Parse("#0f172a"), TaperEnd = 8f };
+    private string _color = "#0f172a";
+    private float _width = 3.5f;
+    private float _inkLength;
+    private string _message = "Sign to continue.";
+
+    private InkDocument? _saved;
+    private string _savedSvg = string.Empty;
+    private string _savedJson = string.Empty;
+    private int _savedBytes;
+
+    private bool IsEmpty => _canvas?.CurrentDocument.IsEmpty ?? true;
+
+    private bool CanUndo => _canvas?.History.CanUndo ?? false;
+
+    // A scribble of one dot is not a signature. Requiring a little ink is a real validation rule that the
+    // vector model makes easy to express.
+    private bool IsValid => _inkLength > 120f;
+
+    private void SetColor(string color)
+    {
+        _color = color;
+        _brush = _brush with { Color = InkColor.Parse(color) };
+    }
+
+    private void OnWidthChanged(ChangeEventArgs e)
+    {
+        if (float.TryParse(e.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out float value))
+        {
+            _width = value;
+            _brush = _brush with { Width = value };
+        }
+    }
+
+    private void OnStrokeCompleted(StrokeEventArgs args)
+    {
+        _message = args.Stroke is { } stroke && stroke.Input.HasRealPressure
+            ? "Captured with pen pressure."
+            : "Captured.";
+    }
+
+    private void OnDocumentChanged(DocumentChangedEventArgs args)
+    {
+        _inkLength = 0f;
+        if (_canvas is null) return;
+        foreach (InkElement element in _canvas.CurrentDocument.AllElements)
+        {
+            if (element is Stroke stroke) _inkLength += stroke.Points.Length;
+        }
+        StateHasChanged();
+    }
+
+    private void Clear()
+    {
+        _canvas?.Clear();
+        _message = "Sign to continue.";
+    }
+
+    private async Task AcceptAsync()
+    {
+        if (_canvas is null) return;
+
+        // Persisting a signature: crop to the ink, keep it as vector data, and label it for accessibility.
+        InkDocument document = _canvas.CurrentDocument.Clone();
+        document.SetMetadata("signed-at", DateTimeOffset.UtcNow.ToString("O"));
+        document.SetMetadata("purpose", "signature");
+
+        _saved = document;
+        _savedJson = InkSerializer.Serialize(document, InkSerializerOptions.Readable);
+        _savedBytes = InkSerializer.SerializeToUtf8Bytes(document).Length;
+        _savedSvg = SvgExporter.Export(document, new SvgExportOptions
+        {
+            Region = ExportRegion.Content,
+            Padding = 12f,
+            Background = InkColor.Transparent,
+            Title = "Signature",
+            IncludeElementDescriptions = true,
+        });
+        _message = "Signature accepted.";
+        await Task.CompletedTask;
+    }
+
+    private Task DownloadSvgAsync()
+        => _canvas?.SaveSvgAsync("signature.svg", new SvgExportOptions
+        {
+            Region = ExportRegion.Content,
+            Padding = 12f,
+            Background = InkColor.Transparent,
+        }) ?? Task.CompletedTask;
+
+    private Task DownloadPngAsync()
+        => _canvas?.SavePngAsync("signature.png", new PngExportOptions
+        {
+            Region = ExportRegion.Content,
+            Padding = 12f,
+            Scale = 3f,
+            Background = InkColor.Transparent,
+        }) ?? Task.CompletedTask;
+}

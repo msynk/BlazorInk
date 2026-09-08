@@ -1,0 +1,264 @@
+@page "/whiteboard"
+@using BlazorInk.Export
+@using System.Numerics
+
+<PageTitle>Whiteboard</PageTitle>
+
+<h1>Whiteboard</h1>
+<p class="page-intro">
+    The full editor: pens, markers, highlighters, three kinds of eraser, shapes, text, selection with move,
+    resize and rotate, layers, pan and zoom. Everything here is built from the public API.
+</p>
+
+<div class="panel">
+    <div class="toolbar" role="toolbar" aria-label="Whiteboard tools">
+        <div class="toolbar-group" role="group" aria-label="Tool">
+            @foreach ((string id, string label, string title) in ToolButtons)
+            {
+                <button type="button" class="btn @(_toolId == id ? "active" : null)" title="@title"
+                        aria-pressed="@(_toolId == id ? "true" : "false")"
+                        @onclick="() => SelectTool(id)">@label</button>
+            }
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group" role="group" aria-label="Colour">
+            @foreach (string color in Palette)
+            {
+                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
+                        aria-label="@color" @onclick="() => SetColor(color)"></button>
+            }
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <label class="field">
+            Size
+            <input type="range" min="1" max="40" step="1" value="@_width" aria-label="Size" @onchange="OnWidthChanged" />
+            <span style="min-width:2ch">@((int)_width)</span>
+        </label>
+
+        @if (_toolId == "eraser")
+        {
+            <label class="field">
+                Eraser
+                <select value="@_eraserMode" @onchange="OnEraserModeChanged" aria-label="Eraser mode">
+                    <option value="Stroke">Whole stroke</option>
+                    <option value="Segment">Part of a stroke</option>
+                    <option value="Pixel">Mask (undoable)</option>
+                </select>
+            </label>
+        }
+
+        <div class="toolbar-spacer"></div>
+
+        <div class="toolbar-group" role="group" aria-label="History">
+            <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)"
+                    @onclick="() => _canvas?.Undo()">Undo</button>
+            <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)"
+                    @onclick="() => _canvas?.Redo()">Redo</button>
+            <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+        </div>
+    </div>
+
+    <div class="toolbar" style="border-top:none">
+        <div class="toolbar-group" role="group" aria-label="View">
+            <button type="button" class="btn" @onclick="() => _canvas?.ZoomBy(1.25f)" aria-label="Zoom in">+</button>
+            <button type="button" class="btn" @onclick="() => _canvas?.ZoomBy(0.8f)" aria-label="Zoom out">-</button>
+            <button type="button" class="btn" @onclick="() => _canvas?.ZoomToFit()">Fit</button>
+            <button type="button" class="btn" @onclick="() => _canvas?.ResetViewport()">100%</button>
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group" role="group" aria-label="Layers">
+            <label class="field">
+                Layer
+                <select value="@_activeLayer" @onchange="OnLayerChanged" aria-label="Active layer">
+                    @foreach (Layer layer in _document.Layers.Reverse())
+                    {
+                        <option value="@layer.Id">@layer.Name</option>
+                    }
+                </select>
+            </label>
+            <button type="button" class="btn" @onclick="AddLayer">Add layer</button>
+            <button type="button" class="btn" @onclick="ToggleLayerVisibility">
+                @(ActiveLayerVisible ? "Hide" : "Show")
+            </button>
+        </div>
+
+        <div class="toolbar-spacer"></div>
+
+        <div class="toolbar-group">
+            <button type="button" class="btn" @onclick="ExportSvgAsync">Export SVG</button>
+            <button type="button" class="btn" @onclick="ExportPngAsync">Export PNG</button>
+        </div>
+    </div>
+
+    <div class="canvas-host">
+        <InkCanvas @ref="_canvas"
+                   Document="_document"
+                   Height="520px"
+                   Tool="_tool"
+                   Brush="_brush"
+                   ShapeStyle="_shapeStyle"
+                   ActiveLayerId="_activeLayer"
+                   EnableTouchGestures="true"
+                   AriaLabel="Whiteboard"
+                   DocumentChanged="() => StateHasChanged()"
+                   Ready="() => StateHasChanged()"
+                   SelectionChanged="() => StateHasChanged()" />
+    </div>
+
+    <CanvasStatus Canvas="_canvas">
+        <span><strong>@(_canvas?.Selection.Count ?? 0)</strong> selected</span>
+        <span><strong>@_document.Layers.Count</strong> layers</span>
+    </CanvasStatus>
+</div>
+
+<div class="note">
+    Selection has real handles: drag inside the box to move, the corners and edges to resize, the circle above it
+    to rotate. Manipulation only changes each element's transform, so the vector data is never rewritten and undo
+    restores it exactly. Arrow keys nudge, Shift makes larger steps, Delete removes.
+</div>
+
+@code {
+    private InkCanvas? _canvas;
+    private readonly InkDocument _document = CreateDocument();
+    private Guid _activeLayer;
+    private string _toolId = "draw";
+    private string _color = "#111827";
+    private float _width = 4f;
+    private string _eraserMode = "Stroke";
+    private ITool _tool = new DrawTool();
+    private Brush _brush = new PenBrush { Width = 4f, Color = InkColor.Parse("#111827") };
+    private ShapeStyle _shapeStyle = new() { StrokeColor = InkColor.Parse("#111827"), StrokeWidth = 3f };
+
+    private static readonly (string Id, string Label, string Title)[] ToolButtons =
+    [
+        ("select", "Select", "Select, move, resize and rotate"),
+        ("draw", "Pen", "Freehand pen"),
+        ("marker", "Marker", "Constant width marker"),
+        ("highlighter", "Highlighter", "Translucent highlighter"),
+        ("eraser", "Eraser", "Eraser"),
+        ("rect", "Rectangle", "Rectangle"),
+        ("ellipse", "Ellipse", "Ellipse"),
+        ("arrow", "Arrow", "Arrow"),
+        ("text", "Text", "Text"),
+        ("pan", "Pan", "Pan and pinch zoom"),
+    ];
+
+    private static readonly string[] Palette =
+        ["#111827", "#dc2626", "#ea580c", "#ca8a04", "#16a34a", "#2563eb", "#7c3aed", "#db2777"];
+
+    private static InkDocument CreateDocument()
+    {
+        var document = new InkDocument(new DocumentSettings { Width = 1600, Height = 1000, Background = InkColor.White });
+        document.UpdateLayer(document.Layers[0].Id, p => p with { Name = "Drawing" });
+        document.AddLayer("Annotations");
+        return document;
+    }
+
+    protected override void OnInitialized()
+    {
+        _activeLayer = _document.Layers[0].Id;
+    }
+
+    private bool ActiveLayerVisible => _document.TryGetLayer(_activeLayer, out Layer? layer) && layer.IsVisible;
+
+    private void SelectTool(string id)
+    {
+        _toolId = id;
+        InkColor color = InkColor.Parse(_color);
+        _shapeStyle = _shapeStyle with { StrokeColor = color, StrokeWidth = MathF.Max(_width * 0.75f, 1f) };
+
+        switch (id)
+        {
+            case "select":
+                _tool = new SelectTool();
+                break;
+            case "draw":
+                _brush = new PenBrush { Width = _width, Color = color };
+                _tool = new DrawTool();
+                break;
+            case "marker":
+                _brush = new MarkerBrush { Width = MathF.Max(_width * 1.5f, 6f), Color = color };
+                _tool = new DrawTool();
+                break;
+            case "highlighter":
+                _brush = new HighlighterBrush { Width = MathF.Max(_width * 4f, 16f), Color = color with { A = 255 } };
+                _tool = new DrawTool();
+                break;
+            case "eraser":
+                _tool = new EraserTool
+                {
+                    Mode = Enum.Parse<EraserMode>(_eraserMode),
+                    Radius = MathF.Max(_width * 2f, 8f),
+                };
+                _brush = new PixelEraserBrush { Width = MathF.Max(_width * 4f, 16f) };
+                break;
+            case "rect":
+                _tool = new ShapeTool(ShapeKind.Rectangle);
+                break;
+            case "ellipse":
+                _tool = new ShapeTool(ShapeKind.Ellipse);
+                break;
+            case "arrow":
+                _tool = new ShapeTool(ShapeKind.Arrow);
+                break;
+            case "text":
+                _tool = new TextTool { Style = TextStyle.Default with { FontSize = MathF.Max(_width * 4f, 14f) } };
+                break;
+            case "pan":
+                _tool = new PanTool();
+                break;
+        }
+    }
+
+    private void SetColor(string color)
+    {
+        _color = color;
+        SelectTool(_toolId);
+    }
+
+    private void OnWidthChanged(ChangeEventArgs e)
+    {
+        if (float.TryParse(e.Value?.ToString(), System.Globalization.CultureInfo.InvariantCulture, out float value))
+        {
+            _width = value;
+            SelectTool(_toolId);
+        }
+    }
+
+    private void OnEraserModeChanged(ChangeEventArgs e)
+    {
+        _eraserMode = e.Value?.ToString() ?? "Stroke";
+        SelectTool("eraser");
+    }
+
+    private void OnLayerChanged(ChangeEventArgs e)
+    {
+        if (Guid.TryParse(e.Value?.ToString(), out Guid id)) _activeLayer = id;
+    }
+
+    private void AddLayer()
+    {
+        Layer layer = _document.AddLayer($"Layer {_document.Layers.Count + 1}");
+        _activeLayer = layer.Id;
+    }
+
+    private void ToggleLayerVisibility()
+    {
+        if (!_document.TryGetLayer(_activeLayer, out Layer? layer)) return;
+        bool visible = layer.IsVisible;
+        _document.UpdateLayer(_activeLayer, p => p with { IsVisible = !visible });
+        _canvas?.Refresh();
+    }
+
+    private Task ExportSvgAsync()
+        => _canvas?.SaveSvgAsync("whiteboard.svg", new SvgExportOptions { Region = ExportRegion.Content, Padding = 24f }) ?? Task.CompletedTask;
+
+    private Task ExportPngAsync()
+        => _canvas?.SavePngAsync("whiteboard.png", new PngExportOptions { Region = ExportRegion.Content, Padding = 24f, Scale = 2f }) ?? Task.CompletedTask;
+}

@@ -1,0 +1,84 @@
+using System.Numerics;
+using BlazorInk.Geometry;
+
+namespace BlazorInk;
+
+/// <summary>
+/// The mapping between document coordinates and view coordinates (CSS pixels of the canvas element).
+/// Immutable; zooming and panning produce new viewports so the document's vector data is never touched.
+/// </summary>
+/// <remarks>
+/// Coordinate spaces:
+/// <list type="bullet">
+/// <item><b>Document</b>: the units elements are stored in.</item>
+/// <item><b>View</b>: CSS pixels relative to the canvas element's top-left. <c>view = document * Zoom + Offset</c>.</item>
+/// <item><b>Device</b>: physical canvas pixels, <c>device = view * DevicePixelRatio</c>; handled by the renderer.</item>
+/// </list>
+/// </remarks>
+public readonly record struct Viewport
+{
+    /// <summary>Identity viewport (zoom 1, no offset).</summary>
+    public static readonly Viewport Identity = new(1f, Vector2.Zero);
+
+    /// <summary>Creates a viewport.</summary>
+    public Viewport(float zoom, Vector2 offset)
+    {
+        Zoom = zoom > 0 && float.IsFinite(zoom) ? zoom : 1f;
+        Offset = new Vector2(float.IsFinite(offset.X) ? offset.X : 0, float.IsFinite(offset.Y) ? offset.Y : 0);
+    }
+
+    /// <summary>Scale factor (1 = one document unit per CSS pixel).</summary>
+    public float Zoom { get; init; }
+
+    /// <summary>View position of the document origin, in CSS pixels.</summary>
+    public Vector2 Offset { get; init; }
+
+    /// <summary>Document to view transform.</summary>
+    public Matrix3x2 DocumentToView => new(Zoom, 0, 0, Zoom, Offset.X, Offset.Y);
+
+    /// <summary>View to document transform.</summary>
+    public Matrix3x2 ViewToDocument => new(1f / Zoom, 0, 0, 1f / Zoom, -Offset.X / Zoom, -Offset.Y / Zoom);
+
+    /// <summary>Converts a view point to document coordinates.</summary>
+    public Vector2 ToDocument(Vector2 view) => (view - Offset) / Zoom;
+
+    /// <summary>Converts a document point to view coordinates.</summary>
+    public Vector2 ToView(Vector2 document) => document * Zoom + Offset;
+
+    /// <summary>Converts a view rectangle to document coordinates.</summary>
+    public Rect ToDocument(Rect view) => new((view.X - Offset.X) / Zoom, (view.Y - Offset.Y) / Zoom, view.Width / Zoom, view.Height / Zoom);
+
+    /// <summary>Converts a document rectangle to view coordinates.</summary>
+    public Rect ToView(Rect document) => new(document.X * Zoom + Offset.X, document.Y * Zoom + Offset.Y, document.Width * Zoom, document.Height * Zoom);
+
+    /// <summary>The document rectangle visible in a view of the given size.</summary>
+    public Rect VisibleRect(Vector2 viewSize) => ToDocument(new Rect(0, 0, viewSize.X, viewSize.Y));
+
+    /// <summary>Returns a viewport translated by a view-space delta.</summary>
+    public Viewport Pan(Vector2 viewDelta) => this with { Offset = Offset + viewDelta };
+
+    /// <summary>Returns a viewport zoomed by a factor around a view-space anchor (the point under the cursor stays put).</summary>
+    public Viewport ZoomBy(float factor, Vector2 viewAnchor, float minZoom = 0.05f, float maxZoom = 64f)
+        => ZoomTo(Math.Clamp(Zoom * factor, minZoom, maxZoom), viewAnchor);
+
+    /// <summary>Returns a viewport with an absolute zoom around a view-space anchor.</summary>
+    public Viewport ZoomTo(float zoom, Vector2 viewAnchor)
+    {
+        if (!(zoom > 0) || !float.IsFinite(zoom)) return this;
+        Vector2 docAnchor = ToDocument(viewAnchor);
+        var next = new Viewport(zoom, Offset);
+        return next with { Offset = viewAnchor - docAnchor * zoom };
+    }
+
+    /// <summary>Creates a viewport that fits a document rectangle inside a view size with padding.</summary>
+    public static Viewport Fit(Rect documentRect, Vector2 viewSize, float padding = 16f, float maxZoom = 64f)
+    {
+        if (documentRect.IsEmpty || viewSize.X <= 0 || viewSize.Y <= 0) return Identity;
+        float availW = MathF.Max(viewSize.X - 2 * padding, 1f);
+        float availH = MathF.Max(viewSize.Y - 2 * padding, 1f);
+        float zoom = MathF.Min(availW / documentRect.Width, availH / documentRect.Height);
+        zoom = Math.Clamp(zoom, 0.01f, maxZoom);
+        Vector2 offset = (viewSize - documentRect.Size * zoom) / 2f - documentRect.TopLeft * zoom;
+        return new Viewport(zoom, offset);
+    }
+}

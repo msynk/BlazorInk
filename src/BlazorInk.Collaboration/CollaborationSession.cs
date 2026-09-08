@@ -1,0 +1,470 @@
+using System.Collections.Concurrent;
+using BlazorInk.Operations;
+using BlazorInk.Serialization;
+
+namespace BlazorInk.Collaboration;
+
+/// <summary>Options for a <see cref="CollaborationSession"/>.</summary>
+public sealed record CollaborationOptions
+{
+    /// <summary>How long a participant's presence is kept after their last update.</summary>
+    public TimeSpan PresenceTimeout { get; init; } = TimeSpan.FromSeconds(20);
+
+    /// <summary>Minimum interval between outgoing presence updates. Presence is throttled, operations are not.</summary>
+    public TimeSpan PresenceInterval { get; init; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>Maximum number of operations queued while disconnected. Older ones are dropped past this point.</summary>
+    public int MaxOfflineQueue { get; init; } = 5000;
+
+    /// <summary>Limits applied to incoming operations, which are untrusted.</summary>
+    public DocumentLimits Limits { get; init; } = DocumentLimits.Default;
+
+    /// <summary>Serialization options for outgoing operations.</summary>
+    public InkSerializerOptions SerializerOptions { get; init; } = InkSerializerOptions.Default;
+
+    /// <summary>Whether the session sends a snapshot when another participant asks for one.</summary>
+    public bool ServeSnapshots { get; init; } = true;
+}
+
+/// <summary>
+/// Synchronizes an <see cref="InkDocument"/> with other participants over an <see cref="ICollaborationTransport"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The design deliberately stops short of a CRDT. Ink is append-mostly and elements are identified by id, so the
+/// operations that matter commute naturally: two people drawing at once produce two additions that can be applied
+/// in any order. The only genuine conflict is two people editing the same element, which is resolved
+/// last-writer-wins on the element's version, with the participant id breaking ties so every replica picks the
+/// same winner.
+/// </para>
+/// <para>
+/// Applications that need stronger guarantees can layer a CRDT on top of these operations; nobody pays for that
+/// complexity by default.
+/// </para>
+/// <para>
+/// While drawing, the in-progress stroke travels as presence, so other participants see ink appear live. The
+/// finished stroke is committed once as a single operation.
+/// </para>
+/// </remarks>
+public sealed class CollaborationSession : IAsyncDisposable
+{
+    private readonly InkDocument _document;
+    private readonly ICollaborationTransport _transport;
+    private readonly CollaborationOptions _options;
+    private readonly ConcurrentDictionary<string, PresenceState> _participants = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> _lastSequence = new(StringComparer.Ordinal);
+    private readonly Queue<CollaborationMessage> _pending = new();
+    private readonly object _queueGate = new();
+    private long _sequence;
+    private DateTimeOffset _lastPresenceSent = DateTimeOffset.MinValue;
+    private PresenceState? _pendingPresence;
+    private bool _applyingRemote;
+    private bool _disposed;
+
+    /// <summary>Creates a session for a document.</summary>
+    /// <param name="document">The document to synchronize.</param>
+    /// <param name="transport">How messages reach other participants.</param>
+    /// <param name="participantId">This participant's stable identifier.</param>
+    /// <param name="options">Session options.</param>
+    public CollaborationSession(InkDocument document, ICollaborationTransport transport, string participantId, CollaborationOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(transport);
+        ArgumentException.ThrowIfNullOrWhiteSpace(participantId);
+
+        _document = document;
+        _transport = transport;
+        ParticipantId = participantId;
+        _options = options ?? new CollaborationOptions();
+
+        _document.Changed += OnDocumentChanged;
+        _transport.MessageReceived += OnMessageReceivedAsync;
+        _transport.ConnectionChanged += OnConnectionChanged;
+    }
+
+    /// <summary>This participant's identifier.</summary>
+    public string ParticipantId { get; }
+
+    /// <summary>The other participants currently present.</summary>
+    public IReadOnlyCollection<PresenceState> Participants
+    {
+        get
+        {
+            ExpireParticipants();
+            return _participants.Values.ToArray();
+        }
+    }
+
+    /// <summary>Number of operations waiting to be sent because the transport is disconnected.</summary>
+    public int PendingCount
+    {
+        get { lock (_queueGate) return _pending.Count; }
+    }
+
+    /// <summary>True when connected and nothing is queued.</summary>
+    public bool IsSynchronized => _transport.IsConnected && PendingCount == 0;
+
+    /// <summary>Raised when another participant's presence changes, so the canvas can redraw their cursor.</summary>
+    public event Action<PresenceState>? PresenceChanged;
+
+    /// <summary>Raised when a participant is removed after their presence expired or they left.</summary>
+    public event Action<string>? ParticipantLeft;
+
+    /// <summary>Raised when a remote operation could not be applied, with the reason.</summary>
+    public event Action<string>? RemoteOperationRejected;
+
+    /// <summary>Asks the other participants for a full document, used when joining an existing session.</summary>
+    public Task RequestSnapshotAsync(CancellationToken cancellationToken = default)
+        => SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.SnapshotRequest,
+            SenderId = ParticipantId,
+            DocumentId = _document.Id,
+            Sequence = Interlocked.Increment(ref _sequence),
+        }, cancellationToken);
+
+    /// <summary>Sends the current document to the other participants.</summary>
+    public Task SendSnapshotAsync(CancellationToken cancellationToken = default)
+        => SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Snapshot,
+            SenderId = ParticipantId,
+            DocumentId = _document.Id,
+            Sequence = Interlocked.Increment(ref _sequence),
+            Snapshot = InkSerializer.Serialize(_document, _options.SerializerOptions),
+        }, cancellationToken);
+
+    /// <summary>
+    /// Publishes this participant's presence. Calls are throttled to <see cref="CollaborationOptions.PresenceInterval"/>;
+    /// the most recent state is always sent eventually.
+    /// </summary>
+    public async Task UpdatePresenceAsync(PresenceState presence, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(presence);
+        _pendingPresence = presence with { ParticipantId = ParticipantId, Timestamp = DateTimeOffset.UtcNow };
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (now - _lastPresenceSent < _options.PresenceInterval) return;
+        _lastPresenceSent = now;
+
+        PresenceState? state = _pendingPresence;
+        _pendingPresence = null;
+        if (state is null) return;
+
+        await SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Presence,
+            SenderId = ParticipantId,
+            DocumentId = _document.Id,
+            Sequence = Interlocked.Increment(ref _sequence),
+            Presence = state,
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Sends any presence update the throttle held back. Call this on a timer or animation frame.</summary>
+    public async Task FlushPresenceAsync(CancellationToken cancellationToken = default)
+    {
+        if (_pendingPresence is null) return;
+        if (DateTimeOffset.UtcNow - _lastPresenceSent < _options.PresenceInterval) return;
+        PresenceState state = _pendingPresence;
+        _pendingPresence = null;
+        _lastPresenceSent = DateTimeOffset.UtcNow;
+        await SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Presence,
+            SenderId = ParticipantId,
+            DocumentId = _document.Id,
+            Sequence = Interlocked.Increment(ref _sequence),
+            Presence = state,
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Sends everything queued while the transport was disconnected.</summary>
+    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        while (_transport.IsConnected && !_disposed)
+        {
+            CollaborationMessage? message;
+            lock (_queueGate)
+            {
+                if (_pending.Count == 0) return;
+                message = _pending.Peek();
+            }
+            try
+            {
+                await _transport.SendAsync(message, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+#pragma warning disable CA1031 // A transport failure must not lose the queue; it stays for the next flush.
+            catch
+            {
+                return;
+            }
+#pragma warning restore CA1031
+            lock (_queueGate)
+            {
+                if (_pending.Count > 0) _pending.Dequeue();
+            }
+        }
+    }
+
+    private void OnDocumentChanged(object? sender, DocumentChangedEventArgs e)
+    {
+        // Remote changes are not echoed back, but local undo and redo are: to everyone else they are ordinary edits.
+        if (_applyingRemote || _disposed) return;
+        if (e.Origin is ChangeOrigin.Remote or ChangeOrigin.Load) return;
+
+        string payload;
+        try
+        {
+            payload = OperationCodec.Serialize(e.Operation, _options.SerializerOptions);
+        }
+        catch (InvalidOperationException ex)
+        {
+            RemoteOperationRejected?.Invoke("A local change could not be shared: " + ex.Message);
+            return;
+        }
+
+        _ = SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Operation,
+            SenderId = ParticipantId,
+            DocumentId = _document.Id,
+            Sequence = Interlocked.Increment(ref _sequence),
+            Operation = payload,
+        }, CancellationToken.None);
+    }
+
+    private async Task SendAsync(CollaborationMessage message, CancellationToken cancellationToken)
+    {
+        if (_disposed) return;
+        if (!_transport.IsConnected)
+        {
+            // Presence is worthless once stale, so only durable changes are queued.
+            if (message.Kind != CollaborationMessageKind.Operation) return;
+            lock (_queueGate)
+            {
+                _pending.Enqueue(message);
+                while (_pending.Count > _options.MaxOfflineQueue) _pending.Dequeue();
+            }
+            return;
+        }
+
+        try
+        {
+            await _transport.SendAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+#pragma warning disable CA1031 // A send failure must not tear down the editor; the change is queued for retry.
+        catch
+        {
+            if (message.Kind == CollaborationMessageKind.Operation)
+            {
+                lock (_queueGate)
+                {
+                    _pending.Enqueue(message);
+                    while (_pending.Count > _options.MaxOfflineQueue) _pending.Dequeue();
+                }
+            }
+        }
+#pragma warning restore CA1031
+    }
+
+    private async Task OnMessageReceivedAsync(CollaborationMessage message)
+    {
+        if (_disposed || message is null) return;
+        if (string.Equals(message.SenderId, ParticipantId, StringComparison.Ordinal)) return;
+
+        // Duplicate delivery is harmless to ignore, and a lower sequence means a retransmission we already saw.
+        if (message.Kind == CollaborationMessageKind.Operation || message.Kind == CollaborationMessageKind.Presence)
+        {
+            long previous = _lastSequence.GetValueOrDefault(message.SenderId, -1);
+            if (message.Sequence <= previous && message.Sequence != 0) return;
+            _lastSequence[message.SenderId] = message.Sequence;
+        }
+
+        switch (message.Kind)
+        {
+            case CollaborationMessageKind.Operation:
+                ApplyRemoteOperation(message);
+                break;
+            case CollaborationMessageKind.Presence:
+                if (message.Presence is { } presence)
+                {
+                    _participants[message.SenderId] = presence;
+                    PresenceChanged?.Invoke(presence);
+                }
+                break;
+            case CollaborationMessageKind.Snapshot:
+                ApplySnapshot(message);
+                break;
+            case CollaborationMessageKind.SnapshotRequest:
+                if (_options.ServeSnapshots) await SendSnapshotAsync().ConfigureAwait(false);
+                break;
+            case CollaborationMessageKind.Leave:
+                if (_participants.TryRemove(message.SenderId, out _)) ParticipantLeft?.Invoke(message.SenderId);
+                break;
+        }
+    }
+
+    private void ApplyRemoteOperation(CollaborationMessage message)
+    {
+        if (message.Operation is not { Length: > 0 } payload) return;
+        DrawingOperation operation;
+        try
+        {
+            operation = OperationCodec.Deserialize(payload, new InkDeserializerOptions { Limits = _options.Limits });
+        }
+        catch (InkFormatException ex)
+        {
+            RemoteOperationRejected?.Invoke($"A change from {message.SenderId} was rejected: {ex.Message}");
+            return;
+        }
+
+        DrawingOperation? resolved = ResolveConflicts(operation, message.SenderId);
+        if (resolved is null) return;
+        operation = resolved;
+        if (!operation.CanApply(_document))
+        {
+            // A stale operation, for example an edit to something already deleted. Dropping it is correct:
+            // the deletion is the newer intent.
+            return;
+        }
+
+        _applyingRemote = true;
+        try
+        {
+            _document.Apply(operation, ChangeOrigin.Remote);
+        }
+        catch (InvalidOperationException ex)
+        {
+            RemoteOperationRejected?.Invoke($"A change from {message.SenderId} could not be applied: {ex.Message}");
+        }
+        finally
+        {
+            _applyingRemote = false;
+        }
+    }
+
+    /// <summary>
+    /// Applies last-writer-wins to element edits. When the local element is newer the remote edit is dropped;
+    /// when versions tie, the participant id decides so that every replica reaches the same result.
+    /// </summary>
+    /// <returns>The operation to apply, or null when it lost the conflict and must be dropped.</returns>
+    private DrawingOperation? ResolveConflicts(DrawingOperation operation, string senderId)
+    {
+        switch (operation)
+        {
+            case ReplaceElementOperation replace when _document.TryGetElement(replace.Element.Id, out InkElement? current):
+            {
+                if (current.Version > replace.Element.Version) return null;
+                if (current.Version == replace.Element.Version && string.CompareOrdinal(ParticipantId, senderId) > 0) return null;
+                return replace;
+            }
+            case BatchOperation batch:
+            {
+                var resolved = new List<DrawingOperation>(batch.Operations.Count);
+                foreach (DrawingOperation inner in batch.Operations)
+                {
+                    DrawingOperation? r = ResolveConflicts(inner, senderId);
+                    if (r is not null) resolved.Add(r);
+                }
+                return resolved.Count == 0 ? null : new BatchOperation(resolved, batch.Label);
+            }
+            default:
+                return operation;
+        }
+    }
+
+    private void ApplySnapshot(CollaborationMessage message)
+    {
+        if (message.Snapshot is not { Length: > 0 } payload) return;
+        InkDocument incoming;
+        try
+        {
+            incoming = InkSerializer.Deserialize(payload, new InkDeserializerOptions { Limits = _options.Limits });
+        }
+        catch (InkFormatException ex)
+        {
+            RemoteOperationRejected?.Invoke("The received document could not be read: " + ex.Message);
+            return;
+        }
+
+        _applyingRemote = true;
+        try
+        {
+            // Replace the contents in one step so a joining participant sees a single change rather than a flood.
+            using (_document.BeginBatch("Synchronize", ChangeOrigin.Remote))
+            {
+                foreach (Layer layer in _document.Layers.ToArray())
+                {
+                    foreach (InkElement element in layer.Elements.ToArray()) _document.Apply(new RemoveElementOperation(element.Id), ChangeOrigin.Remote);
+                }
+                foreach (Layer layer in incoming.Layers)
+                {
+                    Guid target = _document.TryGetLayer(layer.Id, out _) ? layer.Id : Guid.Empty;
+                    if (target == Guid.Empty)
+                    {
+                        _document.Apply(new AddLayerOperation(layer.Id, layer.Properties, null, layer.Elements.ToArray()), ChangeOrigin.Remote);
+                        continue;
+                    }
+                    _document.Apply(new UpdateLayerOperation(layer.Id, layer.Properties), ChangeOrigin.Remote);
+                    foreach (InkElement element in layer.Elements) _document.Apply(new AddElementOperation(layer.Id, element), ChangeOrigin.Remote);
+                }
+            }
+        }
+        finally
+        {
+            _applyingRemote = false;
+        }
+    }
+
+    private void OnConnectionChanged(bool connected)
+    {
+        if (connected) _ = FlushAsync();
+    }
+
+    private void ExpireParticipants()
+    {
+        DateTimeOffset cutoff = DateTimeOffset.UtcNow - _options.PresenceTimeout;
+        foreach ((string id, PresenceState state) in _participants)
+        {
+            if (state.Timestamp < cutoff && _participants.TryRemove(id, out _)) ParticipantLeft?.Invoke(id);
+        }
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        _document.Changed -= OnDocumentChanged;
+        _transport.MessageReceived -= OnMessageReceivedAsync;
+        _transport.ConnectionChanged -= OnConnectionChanged;
+
+        if (_transport.IsConnected)
+        {
+            try
+            {
+                await _transport.SendAsync(new CollaborationMessage
+                {
+                    Kind = CollaborationMessageKind.Leave,
+                    SenderId = ParticipantId,
+                    DocumentId = _document.Id,
+                    Sequence = Interlocked.Increment(ref _sequence),
+                }).ConfigureAwait(false);
+            }
+#pragma warning disable CA1031 // Leaving is best effort.
+            catch
+            {
+            }
+#pragma warning restore CA1031
+        }
+        _participants.Clear();
+    }
+}

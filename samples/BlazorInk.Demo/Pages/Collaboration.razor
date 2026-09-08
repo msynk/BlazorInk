@@ -1,0 +1,176 @@
+@page "/collaboration"
+@using BlazorInk.Collaboration
+@using BlazorInk.Serialization
+@using System.Numerics
+@implements IAsyncDisposable
+
+<PageTitle>Collaboration</PageTitle>
+
+<h1>Collaboration</h1>
+<p class="page-intro">
+    Two independent canvases with two independent documents, synchronized by exchanging operations. Draw on
+    either side and the stroke appears on the other. This runs entirely in the browser over an in-memory
+    transport; a real application implements the same interface over SignalR or WebSockets.
+</p>
+
+<div class="toolbar panel" style="border-radius:10px 10px 0 0;border-bottom:none">
+    <label class="field">
+        Latency
+        <input type="range" min="0" max="400" step="25" value="@_latency" aria-label="Simulated latency"
+               @onchange="OnLatencyChanged" />
+        <span style="min-width:6ch">@_latency ms</span>
+    </label>
+    <div class="toolbar-separator"></div>
+    <label class="field">
+        <input type="checkbox" checked="@_leftOnline" @onchange="e => SetOnline(0, e.Value is true)" />
+        Alex online
+    </label>
+    <label class="field">
+        <input type="checkbox" checked="@_rightOnline" @onchange="e => SetOnline(1, e.Value is true)" />
+        Sam online
+    </label>
+    <div class="toolbar-spacer"></div>
+    <span class="field">Queued while offline: <strong>@(_sessions[0]?.PendingCount ?? 0)</strong> / <strong>@(_sessions[1]?.PendingCount ?? 0)</strong></span>
+</div>
+
+<div class="split" style="gap:1rem">
+    @for (int index = 0; index < 2; index++)
+    {
+        int i = index;
+        <div class="panel">
+            <div class="toolbar">
+                <strong style="color:@Participants[i].Color">@Participants[i].Name</strong>
+                <div class="toolbar-separator"></div>
+                @foreach (string color in Palette)
+                {
+                    <button type="button" class="swatch @(_colors[i] == color ? "active" : null)" style="background:@color"
+                            aria-label="@($"{Participants[i].Name} colour {color}")" @onclick="() => SetColor(i, color)"></button>
+                }
+                <div class="toolbar-spacer"></div>
+                <button type="button" class="btn" @onclick="() => _canvases[i]?.Undo()">Undo</button>
+                <button type="button" class="btn danger" @onclick="() => _canvases[i]?.Clear()">Clear</button>
+            </div>
+
+            <InkCanvas @ref="_canvases[i]"
+                       Document="_documents[i]"
+                       Height="380px"
+                       Brush="_brushes[i]"
+                       AriaLabel="@($"{Participants[i].Name}'s canvas")"
+                       StrokeCompleted="() => OnStrokeCompleted(i)"
+                       DocumentChanged="() => StateHasChanged()" />
+
+            <div class="statusbar">
+                <span><strong>@_documents[i].ElementCount</strong> elements</span>
+                <span>sent <strong>@(_transports[i]?.SentCount ?? 0)</strong> messages, <strong>@FormatBytes(_transports[i]?.SentBytes ?? 0)</strong></span>
+                <span class="badge @(IsOnline(i) ? "on" : null)">@(IsOnline(i) ? "connected" : "offline")</span>
+            </div>
+        </div>
+    }
+</div>
+
+<h2>What travels on the wire</h2>
+<p class="page-intro">
+    Drawing a stroke sends that stroke once, as a single operation. Nothing else is transmitted: not the other
+    strokes, not the document. The most recent message is shown below exactly as it was sent.
+</p>
+<pre class="output"><code>@(_lastMessage ?? "Draw on one of the canvases to see the operation that is sent.")</code></pre>
+
+<div class="note">
+    Conflicts are resolved by last-writer-wins on each element's version, with the participant id breaking ties so
+    every replica reaches the same result. Two people drawing at once never conflict, because each stroke is a new
+    element with its own id. Take a participant offline, draw, and bring them back: their operations are queued and
+    replayed on reconnect.
+</div>
+
+@code {
+    private sealed record Participant(string Id, string Name, string Color);
+
+    private static readonly Participant[] Participants =
+    [
+        new("alex", "Alex", "#2563eb"),
+        new("sam", "Sam", "#16a34a"),
+    ];
+
+    private static readonly string[] Palette = ["#2563eb", "#16a34a", "#dc2626", "#111827"];
+
+    private readonly LoopbackHub _hub = new();
+    private readonly InkCanvas?[] _canvases = new InkCanvas?[2];
+    private readonly InkDocument[] _documents = new InkDocument[2];
+    private readonly CollaborationSession?[] _sessions = new CollaborationSession?[2];
+    private readonly LoopbackTransport?[] _transports = new LoopbackTransport?[2];
+    private readonly Brush[] _brushes = new Brush[2];
+    private readonly string[] _colors = ["#2563eb", "#16a34a"];
+    private string? _lastMessage;
+    private int _latency;
+    private bool _leftOnline = true;
+    private bool _rightOnline = true;
+
+    protected override void OnInitialized()
+    {
+        // Both participants must edit the same document, including its layer ids, or operations would not line
+        // up. That is exactly what joining a session does in a real application: load a snapshot.
+        _documents[0] = new InkDocument(new DocumentSettings { Width = 600, Height = 380, Background = InkColor.White });
+        _documents[1] = InkSerializer.Deserialize(InkSerializer.Serialize(_documents[0]));
+
+        for (int i = 0; i < 2; i++)
+        {
+            _brushes[i] = new PenBrush { Width = 4f, Color = InkColor.Parse(_colors[i]) };
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+            LoopbackTransport transport = _hub.CreateClient();
+            _transports[i] = transport;
+            var session = new CollaborationSession(_documents[i], transport, Participants[i].Id);
+            session.RemoteOperationRejected += reason => { _lastMessage = "Rejected: " + reason; InvokeAsync(StateHasChanged); };
+            _sessions[i] = session;
+        }
+    }
+
+    private bool IsOnline(int index) => index == 0 ? _leftOnline : _rightOnline;
+
+    private void SetColor(int index, string color)
+    {
+        _colors[index] = color;
+        _brushes[index] = new PenBrush { Width = 4f, Color = InkColor.Parse(color) };
+    }
+
+    private void SetOnline(int index, bool online)
+    {
+        if (index == 0) _leftOnline = online;
+        else _rightOnline = online;
+        _transports[index]?.SetConnected(online);
+        StateHasChanged();
+    }
+
+    private void OnLatencyChanged(ChangeEventArgs e)
+    {
+        if (int.TryParse(e.Value?.ToString(), out int value))
+        {
+            _latency = value;
+            _hub.LatencyMilliseconds = value;
+        }
+    }
+
+    private void OnStrokeCompleted(int index)
+    {
+        // Show the exact payload that was sent for the last stroke.
+        if (_documents[index].Layers[0].Elements.Count == 0) return;
+        InkElement last = _documents[index].Layers[0].Elements[^1];
+        var operation = new BlazorInk.Operations.AddElementOperation(_documents[index].Layers[0].Id, last);
+        string json = OperationCodec.Serialize(operation);
+        _lastMessage = $"{Participants[index].Name} sent {json.Length} bytes:\n{json}";
+        StateHasChanged();
+    }
+
+    private static string FormatBytes(long bytes)
+        => bytes < 1024 ? $"{bytes} B" : $"{bytes / 1024.0:0.#} KB";
+
+    public async ValueTask DisposeAsync()
+    {
+        foreach (CollaborationSession? session in _sessions)
+        {
+            if (session is not null) await session.DisposeAsync();
+        }
+    }
+}

@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>BlazorInk</RootNamespace>
+    <PackageId>BlazorInk.Core</PackageId>
+    <Description>Host-independent drawing and ink engine for BlazorInk: vector document model, strokes, brushes, geometry, undo/redo, serialization, SVG and PNG export. No UI or JavaScript dependencies.</Description>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="BlazorInk" />
+    <InternalsVisibleTo Include="BlazorInk.Core.Tests" />
+    <InternalsVisibleTo Include="BlazorInk.Benchmarks" />
+  </ItemGroup>
+</Project>

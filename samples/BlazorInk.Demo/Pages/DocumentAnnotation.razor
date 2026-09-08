@@ -1,0 +1,272 @@
+@page "/document-annotation"
+@using System.Numerics
+
+<PageTitle>Document review</PageTitle>
+
+<h1>Document review</h1>
+<p class="page-intro">
+    A review surface over a document: select text to highlight it, attach a callout comment, or write freehand in
+    the margin. This is the shape a PDF or contract review interface takes. The annotations are vector objects
+    carrying their own metadata, so an application can list them, filter them and store them next to the document
+    rather than burning them into a picture.
+</p>
+
+<div class="panel">
+    <div class="toolbar" role="toolbar" aria-label="Review tools">
+        <div class="toolbar-group" role="group" aria-label="Tool">
+            <button type="button" class="btn @(_toolId == "select" ? "active" : null)" @onclick='() => SelectTool("select")'>Select</button>
+            <button type="button" class="btn @(_toolId == "highlight" ? "active" : null)" @onclick='() => SelectTool("highlight")'>Highlight text</button>
+            <button type="button" class="btn @(_toolId == "callout" ? "active" : null)" @onclick='() => SelectTool("callout")'>Add comment</button>
+            <button type="button" class="btn @(_toolId == "draw" ? "active" : null)" @onclick='() => SelectTool("draw")'>Freehand</button>
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group" role="group" aria-label="Highlight colour">
+            @foreach ((string color, string name) in HighlightColors)
+            {
+                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
+                        aria-label="@name" @onclick="() => SetColor(color)"></button>
+            }
+        </div>
+
+        <div class="toolbar-spacer"></div>
+        <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)" @onclick="() => _canvas?.Undo()">Undo</button>
+        <button type="button" class="btn danger" disabled="@(_annotations.Count == 0)" @onclick="ClearAnnotations">Clear comments</button>
+    </div>
+
+    <div class="split" style="gap:0">
+        <div style="position:relative;background:var(--surface)">
+            <InkCanvas @ref="_canvas"
+                       Document="_document"
+                       Height="620px"
+                       Tool="_tool"
+                       Brush="_brush"
+                       ActiveLayerId="_annotationLayer"
+                       AriaLabel="Document under review"
+                       DocumentChanged="OnDocumentChanged" />
+        </div>
+
+        <div style="padding:1rem;border-left:1px solid var(--border);overflow:auto;max-height:620px">
+            <h2 style="margin-top:0">Comments</h2>
+            @if (_annotations.Count == 0)
+            {
+                <p style="color:var(--text-muted);font-size:0.87rem">
+                    Drag across a line of text to highlight it, or pick "Add comment" and drag where the note should point.
+                </p>
+            }
+            else
+            {
+                <ul style="list-style:none;padding:0;margin:0;display:grid;gap:0.6rem">
+                    @foreach (AnnotationEntry entry in _annotations)
+                    {
+                        <li class="card" style="padding:0.7rem 0.8rem">
+                            <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:start">
+                                <div>
+                                    <strong style="font-size:0.85rem">@entry.Kind</strong>
+                                    <div style="color:var(--text-muted);font-size:0.85rem">@entry.Text</div>
+                                </div>
+                                <button type="button" class="btn icon danger" aria-label="Delete comment"
+                                        @onclick="() => Delete(entry.Id)">&times;</button>
+                            </div>
+                        </li>
+                    }
+                </ul>
+            }
+        </div>
+    </div>
+
+    <CanvasStatus Canvas="_canvas" />
+</div>
+
+<div class="note">
+    Each annotation carries a description, so the exported SVG and the accessible summary of the canvas both
+    report what is on the page. That is how a canvas-based review tool stays usable with a screen reader: the
+    strokes themselves cannot be described, but the objects around them can.
+</div>
+
+@code {
+    private sealed record AnnotationEntry(Guid Id, string Kind, string Text);
+
+    private InkCanvas? _canvas;
+    private readonly InkDocument _document = new(new DocumentSettings { Width = 620, Height = 620, Background = InkColor.White });
+    private Guid _pageLayer;
+    private Guid _annotationLayer;
+    private string _toolId = "highlight";
+    private string _color = "#fde047";
+    private ITool _tool = new ShapeTool(ShapeKind.Highlight);
+    private Brush _brush = new PenBrush { Width = 2.5f, Color = InkColor.Parse("#b91c1c") };
+    private readonly List<AnnotationEntry> _annotations = new();
+    private int _commentNumber;
+
+    private static readonly (string Color, string Name)[] HighlightColors =
+    [
+        ("#fde047", "Yellow"),
+        ("#86efac", "Green"),
+        ("#93c5fd", "Blue"),
+        ("#fca5a5", "Red"),
+    ];
+
+    private static readonly string[] Paragraph =
+    [
+        "Master Services Agreement",
+        "",
+        "1. Scope of work",
+        "The supplier shall provide the services described in each",
+        "statement of work agreed between the parties. No change to",
+        "the scope takes effect until both parties have signed a",
+        "written amendment.",
+        "",
+        "2. Fees and payment",
+        "Invoices are due thirty days from receipt. Late payment",
+        "accrues interest at two per cent per month, or the maximum",
+        "permitted by law, whichever is lower.",
+        "",
+        "3. Intellectual property",
+        "All deliverables created under this agreement become the",
+        "property of the customer on payment in full. The supplier",
+        "retains ownership of pre-existing materials and grants a",
+        "perpetual licence to use them within the deliverables.",
+        "",
+        "4. Termination",
+        "Either party may terminate for material breach on thirty",
+        "days written notice if the breach is not remedied.",
+    ];
+
+    protected override void OnInitialized()
+    {
+        _document.UpdateLayer(_document.Layers[0].Id, p => p with { Name = "Page" });
+        _pageLayer = _document.Layers[0].Id;
+        BuildPage();
+        _document.UpdateLayer(_pageLayer, p => p with { IsLocked = true });
+        _annotationLayer = _document.AddLayer("Annotations").Id;
+    }
+
+    /// <summary>Lays out the document text as real text elements, so it can be selected, exported and read.</summary>
+    private void BuildPage()
+    {
+        const float left = 48f;
+        float y = 56f;
+        using (_document.BeginBatch("Load document"))
+        {
+            foreach (string line in Paragraph)
+            {
+                if (line.Length > 0)
+                {
+                    bool heading = line.Length > 0 && (char.IsDigit(line[0]) || line.StartsWith("Master", StringComparison.Ordinal));
+                    var style = TextStyle.Default with
+                    {
+                        FontSize = heading ? 15f : 13.5f,
+                        Bold = heading,
+                        Color = InkColor.Parse("#1f2933"),
+                    };
+                    _document.AddElement(new TextElement(new Vector2(left, y), line)
+                    {
+                        Style = style,
+                        Size = new Vector2(520, style.FontSize * 1.3f),
+                        Padding = 0f,
+                    }, _pageLayer);
+                }
+                y += 24f;
+            }
+        }
+    }
+
+    private void SelectTool(string id)
+    {
+        _toolId = id;
+        _tool = id switch
+        {
+            "select" => new SelectTool(),
+            "callout" => new ShapeTool(ShapeKind.Rectangle),
+            "draw" => new DrawTool(),
+            _ => new ShapeTool(ShapeKind.Highlight),
+        };
+    }
+
+    private void SetColor(string color)
+    {
+        _color = color;
+        SelectTool(_toolId);
+    }
+
+    private void OnDocumentChanged(DocumentChangedEventArgs args)
+    {
+        // Turn a freshly drawn shape into the right kind of annotation and index it for the comment list.
+        if (args.Operation is BlazorInk.Operations.AddElementOperation add && add.LayerId == _annotationLayer)
+        {
+            Convert(add.Element);
+        }
+        Reindex();
+        StateHasChanged();
+    }
+
+    private void Convert(InkElement element)
+    {
+        switch (_toolId)
+        {
+            case "highlight" when element is HighlightElement highlight && highlight.Color != InkColor.Parse(_color):
+                _document.ReplaceElement(highlight with
+                {
+                    Color = InkColor.Parse(_color),
+                    Description = "Highlight over " + DescribeTextUnder(highlight.Bounds),
+                });
+                break;
+
+            case "callout" when element is RectangleShape box:
+                _commentNumber++;
+                string text = $"Comment {_commentNumber}: please review this clause.";
+                // The box the user dragged becomes the callout body; the anchor points at the text beneath it.
+                _document.ReplaceElement(new CalloutElement(box.Rect, new Vector2(box.Rect.Left - 24f, box.Rect.Center.Y), text)
+                {
+                    Id = box.Id,
+                    Version = box.Version,
+                    Description = text,
+                });
+                break;
+
+            case "draw" when element is Stroke stroke && stroke.Description is null:
+                _document.ReplaceElement(stroke with { Description = "Handwritten margin note" });
+                break;
+        }
+    }
+
+    private string DescribeTextUnder(Rect area)
+    {
+        foreach (InkElement element in _document.Layers.First(l => l.Id == _pageLayer).Elements)
+        {
+            if (element is TextElement text && text.Bounds.Intersects(area)) return "\"" + text.Text + "\"";
+        }
+        return "the page";
+    }
+
+    private void Reindex()
+    {
+        _annotations.Clear();
+        if (!_document.TryGetLayer(_annotationLayer, out Layer? layer)) return;
+        foreach (InkElement element in layer.Elements)
+        {
+            string kind = element switch
+            {
+                HighlightElement => "Highlight",
+                CalloutElement => "Comment",
+                Stroke => "Freehand note",
+                _ => element.TypeName,
+            };
+            _annotations.Add(new AnnotationEntry(element.Id, kind, element.GetAccessibleDescription()));
+        }
+    }
+
+    private void Delete(Guid id)
+    {
+        _document.RemoveElement(id);
+        _canvas?.Refresh();
+    }
+
+    private void ClearAnnotations()
+    {
+        if (!_document.TryGetLayer(_annotationLayer, out Layer? layer)) return;
+        _document.RemoveElements(layer.Elements.Select(e => e.Id).ToArray());
+        _canvas?.Refresh();
+    }
+}

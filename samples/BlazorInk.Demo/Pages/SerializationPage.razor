@@ -1,0 +1,129 @@
+@page "/serialization"
+@using BlazorInk.Export
+@using BlazorInk.Serialization
+@using System.Numerics
+
+<PageTitle>Serialization</PageTitle>
+
+<h1>Serialization</h1>
+<p class="page-intro">
+    Drawings are vector documents, not pictures. Draw on the left, then save, reload and export on the right.
+    The compact format stores a handwriting point in a few bytes; the readable format is the same data as plain
+    JSON for diffing and inspection.
+</p>
+
+<div class="split">
+    <div class="panel">
+        <div class="toolbar">
+            <span class="field">Draw something, then save it.</span>
+            <div class="toolbar-spacer"></div>
+            <button type="button" class="btn" @onclick="() => _canvas?.Undo()">Undo</button>
+            <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+        </div>
+        <InkCanvas @ref="_canvas" Height="340px" Brush="_brush" AriaLabel="Source drawing"
+                   DocumentChanged="() => StateHasChanged()"
+                   Ready="() => StateHasChanged()" />
+        <CanvasStatus Canvas="_canvas" />
+    </div>
+
+    <div class="panel">
+        <div class="toolbar">
+            <button type="button" class="btn primary" @onclick="Save">Save</button>
+            <button type="button" class="btn" disabled="@(_saved is null)" @onclick="Load">Load into the canvas</button>
+            <div class="toolbar-spacer"></div>
+            <label class="field">
+                <input type="checkbox" checked="@_readable" @onchange="OnReadableChanged" />
+                Readable JSON
+            </label>
+        </div>
+
+        @if (_stats is not null)
+        {
+            <table>
+                <thead>
+                    <tr><th>Measure</th><th>Value</th></tr>
+                </thead>
+                <tbody>
+                    <tr><td>Elements</td><td>@_stats.Elements</td></tr>
+                    <tr><td>Stroke points</td><td>@_stats.Points</td></tr>
+                    <tr><td>Compact document</td><td>@FormatBytes(_stats.CompactBytes)</td></tr>
+                    <tr><td>Readable document</td><td>@FormatBytes(_stats.ReadableBytes)</td></tr>
+                    <tr><td>Bytes per point (compact)</td><td>@(_stats.Points == 0 ? "-" : (_stats.CompactBytes / (double)_stats.Points).ToString("0.0"))</td></tr>
+                    <tr><td>SVG export</td><td>@FormatBytes(_stats.SvgBytes)</td></tr>
+                    <tr><td>PNG export (1x)</td><td>@FormatBytes(_stats.PngBytes)</td></tr>
+                    <tr><td>Round trip identical</td><td>@(_stats.RoundTripStable ? "yes" : "no")</td></tr>
+                </tbody>
+            </table>
+        }
+        else
+        {
+            <p style="padding:1rem;color:var(--text-muted)">Save the drawing to see how it is stored.</p>
+        }
+    </div>
+</div>
+
+@if (_saved is not null)
+{
+    <h2>Stored document</h2>
+    <pre class="output"><code>@_saved</code></pre>
+}
+
+<div class="note">
+    The format carries a schema version. A document written by a newer version is refused with an explanation
+    rather than being partially read, and elements of unknown types are preserved untouched through a load and
+    save, so an old build never silently destroys work made by a new one.
+</div>
+
+@code {
+    private sealed record Stats(int Elements, long Points, int CompactBytes, int ReadableBytes, int SvgBytes, int PngBytes, bool RoundTripStable);
+
+    private InkCanvas? _canvas;
+    private readonly Brush _brush = new PenBrush { Width = 4f, Color = InkColor.Parse("#111827") };
+    private string? _saved;
+    private bool _readable;
+    private Stats? _stats;
+
+    private void OnReadableChanged(ChangeEventArgs e)
+    {
+        _readable = e.Value is true;
+        if (_saved is not null) Save();
+    }
+
+    private void Save()
+    {
+        if (_canvas is null) return;
+        InkDocument document = _canvas.CurrentDocument;
+
+        string compact = InkSerializer.Serialize(document);
+        string readable = InkSerializer.Serialize(document, InkSerializerOptions.Readable);
+        _saved = _readable ? readable : compact;
+
+        // A round trip must be byte-for-byte stable, otherwise saving twice would create spurious changes.
+        string again = InkSerializer.Serialize(InkSerializer.Deserialize(compact));
+
+        _stats = new Stats(
+            document.ElementCount,
+            document.TotalPointCount,
+            System.Text.Encoding.UTF8.GetByteCount(compact),
+            System.Text.Encoding.UTF8.GetByteCount(readable),
+            System.Text.Encoding.UTF8.GetByteCount(SvgExporter.Export(document)),
+            PngExporter.Export(document).Length,
+            string.Equals(compact, again, StringComparison.Ordinal));
+    }
+
+    private void Load()
+    {
+        if (_canvas is null || _saved is null) return;
+        if (InkSerializer.TryDeserialize(_saved, out InkDocument? document, out string? error) && document is not null)
+        {
+            _canvas.LoadDocument(document);
+        }
+        else
+        {
+            _saved = "Could not load: " + error;
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+        => bytes < 1024 ? $"{bytes} B" : $"{bytes / 1024.0:0.#} KB";
+}

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>BlazorInk.Collaboration</RootNamespace>
+    <PackageId>BlazorInk.Collaboration</PackageId>
+    <Description>Transport-agnostic real-time collaboration for BlazorInk documents: operation synchronization, presence and cursors, reconnect and offline queues.</Description>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../BlazorInk.Core/BlazorInk.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="BlazorInk.Core.Tests" />
+  </ItemGroup>
+</Project>

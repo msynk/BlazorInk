@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>BlazorInk</RootNamespace>
+    <PackageId>BlazorInk</PackageId>
+    <Description>Native Blazor drawing and ink components: InkCanvas with high-quality stroke rendering, stylus pressure/tilt support, brushes, erasers, selection, layers, annotations, undo/redo, SVG/PNG export. Works in Blazor WebAssembly, Server and Hybrid.</Description>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <StaticWebAssetBasePath>_content/BlazorInk</StaticWebAssetBasePath>
+  </PropertyGroup>
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../BlazorInk.Core/BlazorInk.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" VersionOverride="8.0.22" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="BlazorInk.Tests" />
+    <InternalsVisibleTo Include="BlazorInk.Collaboration" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,302 @@
+using BlazorInk.Canvas;
+using BlazorInk.Geometry;
+using BlazorInk.Input;
+using Microsoft.AspNetCore.Components;
+using Microsoft.JSInterop;
+
+namespace BlazorInk.Interop;
+
+/// <summary>Which canvas layer a command buffer is drawn onto.</summary>
+public enum CanvasLayer
+{
+    /// <summary>The document surface: committed elements. Redrawn only when the document or viewport changes.</summary>
+    Document,
+    /// <summary>The overlay surface: the live stroke, selection handles and tool previews. Redrawn every frame of a gesture.</summary>
+    Overlay,
+}
+
+/// <summary>Options passed to the browser layer when a canvas is attached.</summary>
+internal sealed record InteropOptions
+{
+    public bool LowLatency { get; init; } = true;
+    public bool RejectTouchWhilePen { get; init; } = true;
+    public bool SuppressContextMenu { get; init; } = true;
+    public bool TrackHover { get; init; }
+    public bool PreventDefaultOnDown { get; init; } = true;
+    public bool WetInk { get; init; }
+    public bool HandleKeyboard { get; init; } = true;
+}
+
+/// <summary>Size and capability information reported by the browser.</summary>
+internal sealed record AttachResult
+{
+    public double Width { get; init; }
+    public double Height { get; init; }
+    public double DevicePixelRatio { get; init; } = 1;
+    public int MaxTouchPoints { get; init; }
+    public bool CoalescedEvents { get; init; }
+    public bool PredictedEvents { get; init; }
+    public bool PointerEvents { get; init; }
+    public bool Tilt { get; init; }
+    public bool Twist { get; init; }
+    public bool OffscreenCanvas { get; init; }
+    public bool LowLatency { get; init; }
+
+    public InputCapabilities ToCapabilities() => new()
+    {
+        PointerEvents = PointerEvents,
+        CoalescedEvents = CoalescedEvents,
+        PredictedEvents = PredictedEvents,
+        Tilt = Tilt,
+        Twist = Twist,
+        MaxTouchPoints = MaxTouchPoints,
+        DevicePixelRatio = DevicePixelRatio <= 0 ? 1 : DevicePixelRatio,
+        OffscreenCanvas = OffscreenCanvas,
+        LowLatencyCanvas = LowLatency,
+    };
+}
+
+/// <summary>Measured text dimensions returned by the browser.</summary>
+internal sealed record TextMetrics
+{
+    public double Width { get; init; }
+    public int Lines { get; init; } = 1;
+}
+
+/// <summary>Natural size of a loaded image.</summary>
+internal sealed record ImageMetrics
+{
+    public int Width { get; init; }
+    public int Height { get; init; }
+}
+
+/// <summary>Receives events from the browser layer.</summary>
+internal interface IInkInteropClient
+{
+    void OnSamples(ReadOnlySpan<double> data, int count);
+    void OnResized(double width, double height, double devicePixelRatio);
+    void OnKey(string key, bool ctrl, bool shift, bool alt);
+    void OnTextEditorKey(string key, string value);
+}
+
+/// <summary>
+/// The bridge between the C# engine and the browser layer. One instance per canvas.
+/// </summary>
+/// <remarks>
+/// <para>
+/// All calls funnel through a single JavaScript module. In WebAssembly the high-volume rendering direction uses
+/// <c>[JSImport]</c> with a memory view, which hands the command buffer to JavaScript without copying or
+/// serializing it. Everywhere else, and for the low-volume calls, the standard <see cref="IJSRuntime"/> path is
+/// used, so the same component works in Blazor Server and in hybrid hosts.
+/// </para>
+/// <para>Input always travels as one batched call per animation frame, never one call per pointer event.</para>
+/// </remarks>
+internal sealed class InkInterop : IAsyncDisposable
+{
+    /// <summary>The module path used with Blazor's importer, which resolves it against the document base URI.</summary>
+    private const string ModulePath = "./_content/BlazorInk/blazorink.js";
+
+    /// <summary>The same file relative to the application root, for importers that do not use the document base.</summary>
+    private const string ModuleRelativePath = "_content/BlazorInk/blazorink.js";
+
+    private readonly IJSRuntime _jsRuntime;
+    private readonly IInkInteropClient _client;
+    private readonly string _id;
+    private readonly string _baseUri;
+    private IJSObjectReference? _module;
+    private DotNetObjectReference<InteropCallbacks>? _callbacks;
+    private bool _useWasmFastPath;
+    private bool _disposed;
+
+    public InkInterop(IJSRuntime jsRuntime, IInkInteropClient client, string id, string baseUri)
+    {
+        ArgumentNullException.ThrowIfNull(jsRuntime);
+        ArgumentNullException.ThrowIfNull(client);
+        _jsRuntime = jsRuntime;
+        _client = client;
+        _id = id;
+        _baseUri = baseUri;
+    }
+
+    /// <summary>True when the zero-copy WebAssembly rendering path is in use.</summary>
+    public bool UsesFastPath => _useWasmFastPath;
+
+    /// <summary>Loads the module, attaches to the element and returns the browser's capabilities.</summary>
+    public async Task<AttachResult?> AttachAsync(ElementReference element, InteropOptions options, CancellationToken cancellationToken = default)
+    {
+        _module = await _jsRuntime.InvokeAsync<IJSObjectReference>("import", cancellationToken, ModulePath).ConfigureAwait(false);
+        if (_module is null) return null;
+
+        AttachResult? result = await _module.InvokeAsync<AttachResult?>("attach", cancellationToken, _id, element, options).ConfigureAwait(false);
+        if (result is null) return null;
+
+        _callbacks = DotNetObjectReference.Create(new InteropCallbacks(_client));
+        await _module.InvokeVoidAsync("setDotNetCallbacks", cancellationToken, _id, _callbacks).ConfigureAwait(false);
+
+        if (OperatingSystem.IsBrowser())
+        {
+            // The WebAssembly runtime resolves module specifiers against its own location under _framework, not
+            // against the document base, so the fast path needs an absolute URL. The module keeps its surfaces on
+            // globalThis, so importing it twice still gives both views the same state.
+            _useWasmFastPath = await WasmRenderBridge.TryInitializeAsync(ResolveModuleUrl()).ConfigureAwait(false);
+        }
+        return result;
+    }
+
+    private string ResolveModuleUrl()
+    {
+        if (Uri.TryCreate(_baseUri, UriKind.Absolute, out Uri? baseUri) && Uri.TryCreate(baseUri, ModuleRelativePath, out Uri? absolute))
+        {
+            return absolute.ToString();
+        }
+        return "/" + ModuleRelativePath;
+    }
+
+    /// <summary>Sets the canvas backing store size for a CSS size and device pixel ratio.</summary>
+    public ValueTask SetSizeAsync(double cssWidth, double cssHeight, double devicePixelRatio)
+        => InvokeVoidAsync("setSize", _id, cssWidth, cssHeight, devicePixelRatio);
+
+    /// <summary>Sends a recorded command buffer to a canvas layer.</summary>
+    public ValueTask ExecuteAsync(CanvasLayer layer, CanvasRenderContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (_disposed || context.IsEmpty) return ValueTask.CompletedTask;
+        string layerName = layer == CanvasLayer.Document ? "document" : "overlay";
+        string[] strings = context.Strings.Count == 0 ? [] : [.. context.Strings];
+
+        if (_useWasmFastPath)
+        {
+            // Hands the buffer straight to JavaScript as a view over managed memory: no copy, no serialization.
+            WasmRenderBridge.Execute(_id, layerName, context.CommandSegment, context.Count, strings);
+            return ValueTask.CompletedTask;
+        }
+        return InvokeVoidAsync("execute", _id, layerName, context.CommandSegment.ToArray(), context.Count, strings);
+    }
+
+    /// <summary>Sets the cursor shown over the canvas.</summary>
+    public ValueTask SetCursorAsync(string cursor) => InvokeVoidAsync("setCursor", _id, cursor);
+
+    /// <summary>Configures the provisional trail drawn while a sample batch is in flight (Blazor Server only).</summary>
+    public ValueTask SetWetInkStyleAsync(InkColor? color, float width, float opacity)
+        => InvokeVoidAsync("setWetInkStyle", _id, color?.ToCss(), width, opacity);
+
+    /// <summary>Loads an image in the browser and returns its natural size.</summary>
+    public async Task<ImageMetrics?> LoadImageAsync(string uri, CancellationToken cancellationToken = default)
+    {
+        if (_module is null || _disposed) return null;
+        try
+        {
+            return await _module.InvokeAsync<ImageMetrics>("loadImage", cancellationToken, _id, uri).ConfigureAwait(false);
+        }
+        catch (JSException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Measures text with the browser's font metrics.</summary>
+    public async Task<TextMetrics?> MeasureTextAsync(string text, string font, CancellationToken cancellationToken = default)
+    {
+        if (_module is null || _disposed) return null;
+        return await _module.InvokeAsync<TextMetrics>("measureText", cancellationToken, _id, text, font).ConfigureAwait(false);
+    }
+
+    /// <summary>Renders a command buffer into an offscreen canvas and returns encoded image bytes.</summary>
+    public async Task<byte[]> RenderToImageAsync(int pixelWidth, int pixelHeight, CanvasRenderContext context, string mimeType, double quality, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (_module is null || _disposed) return [];
+        string[] strings = context.Strings.Count == 0 ? [] : [.. context.Strings];
+        return await _module.InvokeAsync<byte[]>("renderToImage", cancellationToken, _id, pixelWidth, pixelHeight, context.CommandSegment.ToArray(), context.Count, strings, mimeType, quality).ConfigureAwait(false);
+    }
+
+    /// <summary>Offers bytes to the user as a file download.</summary>
+    public ValueTask SaveFileAsync(string fileName, byte[] bytes, string mimeType)
+        => InvokeVoidAsync("saveFile", fileName, bytes, mimeType);
+
+    /// <summary>Returns the element's current CSS size and device pixel ratio.</summary>
+    public async Task<AttachResult?> GetSizeAsync(CancellationToken cancellationToken = default)
+    {
+        if (_module is null || _disposed) return null;
+        return await _module.InvokeAsync<AttachResult?>("getSize", cancellationToken, _id).ConfigureAwait(false);
+    }
+
+    /// <summary>True when the user asked for reduced motion.</summary>
+    public async Task<bool> PrefersReducedMotionAsync()
+    {
+        if (_module is null || _disposed) return false;
+        try
+        {
+            return await _module.InvokeAsync<bool>("prefersReducedMotion").ConfigureAwait(false);
+        }
+        catch (JSException)
+        {
+            return false;
+        }
+    }
+
+    private ValueTask InvokeVoidAsync(string identifier, params object?[] args)
+    {
+        if (_module is null || _disposed) return ValueTask.CompletedTask;
+        return _module.InvokeVoidAsync(identifier, args);
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_module is not null)
+        {
+            try
+            {
+                await _module.InvokeVoidAsync("detach", _id).ConfigureAwait(false);
+                await _module.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (JSDisconnectedException)
+            {
+                // The circuit or page is already gone; nothing to clean up on the other side.
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+            catch (TaskCanceledException)
+            {
+            }
+        }
+        _callbacks?.Dispose();
+        _callbacks = null;
+        _module = null;
+    }
+
+    /// <summary>The object JavaScript calls back into. Kept separate so the public surface stays small.</summary>
+    internal sealed class InteropCallbacks(IInkInteropClient client)
+    {
+        /// <summary>Receives one batch of pointer samples per animation frame.</summary>
+        [JSInvokable]
+        public void OnPointerSamples(double[] data, int count)
+        {
+            if (data is null || count <= 0) return;
+            client.OnSamples(data.AsSpan(0, Math.Min(data.Length, count * InputSample.PackedSize)), count);
+        }
+
+        /// <summary>Reports a size or device pixel ratio change.</summary>
+        [JSInvokable]
+        public void OnResized(double width, double height, double devicePixelRatio)
+            => client.OnResized(width, height, devicePixelRatio);
+
+        /// <summary>Reports a key press while the canvas has focus.</summary>
+        [JSInvokable]
+        public void OnKeyDown(string key, bool ctrl, bool shift, bool alt)
+        {
+            if (!string.IsNullOrEmpty(key)) client.OnKey(key, ctrl, shift, alt);
+        }
+
+        /// <summary>Reports a commit or cancel from the inline text editor, with its current value.</summary>
+        [JSInvokable]
+        public void OnTextEditorKey(string key, string value)
+        {
+            if (!string.IsNullOrEmpty(key)) client.OnTextEditorKey(key, value ?? string.Empty);
+        }
+    }
+}
