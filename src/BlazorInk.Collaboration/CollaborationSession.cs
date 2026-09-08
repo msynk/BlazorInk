@@ -179,6 +179,15 @@ public sealed class CollaborationSession : IAsyncDisposable
         }, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Drops everything queued while disconnected. Use it when the local changes have been superseded, for
+    /// example after accepting a snapshot, so stale operations are not replayed on top of it.
+    /// </summary>
+    public void ClearPending()
+    {
+        lock (_queueGate) _pending.Clear();
+    }
+
     /// <summary>Sends everything queued while the transport was disconnected.</summary>
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {

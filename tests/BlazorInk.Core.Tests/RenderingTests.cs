@@ -418,6 +418,72 @@ public class SvgExportTests
     }
 
     [Fact]
+    public void Colours_are_emitted_as_hex_and_can_carry_no_payload()
+    {
+        InkDocument document = TestData.SampleDocument();
+        string svg = SvgExporter.Export(document);
+
+        foreach (System.Text.RegularExpressions.Match match in System.Text.RegularExpressions.Regex.Matches(svg, @"(?:fill|stroke)=""([^""]*)"""))
+        {
+            string value = match.Groups[1].Value;
+            Assert.True(value == "none" || System.Text.RegularExpressions.Regex.IsMatch(value, "^#[0-9a-f]{6}$"),
+                $"colour attribute carried an unexpected value: {value}");
+        }
+    }
+
+    [Fact]
+    public void The_only_external_reference_an_export_can_contain_is_an_image()
+    {
+        // Documented behaviour: an image element with a remote source is written as a reference to it. Nothing
+        // else in the output may point outside the file.
+        var document = new InkDocument(new DocumentSettings { Width = 100, Height = 100 });
+        document.AddElement(new Stroke(TestData.Line(new Vector2(0, 50), new Vector2(100, 50), 10), new PenBrush()));
+        document.AddElement(new TextElement(new Vector2(5, 5), "hello"));
+
+        string svg = SvgExporter.Export(document);
+        Assert.DoesNotContain("href", svg, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("url(http", svg, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("@import", svg, StringComparison.OrdinalIgnoreCase);
+
+        // With an image, exactly one reference appears, and it is the image's own source.
+        byte[] png = TestData.CreatePng(4, 4, (_, _) => InkColor.Black);
+        document.AddElement(new ImageElement(Rendering.ImageSource.FromBytes(png, "image/png", 4, 4), new Rect(0, 0, 50, 50)));
+        string withImage = SvgExporter.Export(document);
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(withImage, "href="));
+    }
+
+    [Fact]
+    public void An_element_that_leaves_a_scope_open_cannot_unbalance_the_document()
+    {
+        // A cropped image opens a clip scope. Getting the pairing wrong closed the layer group early, which let
+        // later elements escape their layer's isolation.
+        var document = new InkDocument(new DocumentSettings { Width = 200, Height = 200 });
+        byte[] png = TestData.CreatePng(8, 8, (_, _) => InkColor.Black);
+        document.UpdateLayer(document.Layers[0].Id, p => p with { Opacity = 0.5f });
+        document.AddElement(new ImageElement(Rendering.ImageSource.FromBytes(png, "image/png", 8, 8), new Rect(0, 0, 80, 80))
+        {
+            Crop = new Rect(2, 2, 4, 4),
+            Transform = Matrix3x2.CreateRotation(0.3f),
+        });
+        document.AddElement(new RectangleShape(new Rect(100, 100, 50, 50)));
+
+        string svg = SvgExporter.Export(document);
+        XmlDocument xml = Parse(svg);
+
+        // The rectangle must still be inside the layer group, which the image must not have closed.
+        XmlNodeList rects = xml.GetElementsByTagName("rect");
+        bool foundInsideGroup = false;
+        foreach (XmlNode node in rects)
+        {
+            for (XmlNode? parent = node.ParentNode; parent is not null; parent = parent.ParentNode)
+            {
+                if (parent.LocalName == "g" && parent.Attributes?["data-layer"] is not null) foundInsideGroup = true;
+            }
+        }
+        Assert.True(foundInsideGroup, "the element after a cropped image fell outside its layer group");
+    }
+
+    [Fact]
     public void Eraser_strokes_become_masks()
     {
         var document = new InkDocument(new DocumentSettings { Width = 100, Height = 100 });

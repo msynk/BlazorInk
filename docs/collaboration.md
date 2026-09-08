@@ -47,8 +47,9 @@ public interface ICollaborationTransport
 ```
 
 Implement it over SignalR, WebSockets, WebRTC or anything else. The transport must deliver messages and exclude
-the sender from its own broadcasts. It does not need to guarantee ordering: the session tolerates reordering and
-duplicates by sequence number.
+the sender from its own broadcasts. Each sender's messages must arrive in order, which SignalR and WebSockets both
+give you; a message that arrives after a later one from the same sender is discarded. Duplicates are harmless, and
+ordering between different senders does not matter.
 
 A SignalR implementation is about thirty lines: forward `SendAsync` to a hub method, raise `MessageReceived` from
 a hub callback, and raise `ConnectionChanged` from the connection's reconnect events.
@@ -61,7 +62,7 @@ format.
 
 ```csharp
 string json = OperationCodec.Serialize(operation);
-DrawingOperation operation = OperationCodec.Deserialize(json);
+DrawingOperation received = OperationCodec.Deserialize(json);
 ```
 
 Incoming operations are validated exactly like a loaded file, against `CollaborationOptions.Limits`. A participant

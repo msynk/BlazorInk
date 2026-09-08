@@ -42,8 +42,12 @@ var options = new SvgExportOptions
 ### Safety
 
 The writer XML-escapes everything that reaches the output, including text content, descriptions and font family
-names. It never emits script, event handler attributes, foreign objects or external references. Colours are
-emitted as hex, which cannot carry a payload. The export tests assert all of this against hostile input.
+names. It never emits script, event handler attributes or foreign objects, and colours are emitted as hex, which
+cannot carry a payload. The export tests assert this against hostile input.
+
+Images are the one external reference the output can contain: an `ImageElement` whose source is an `https:` URL
+is written as an `image` element pointing at it. Embed images as data URIs, or refuse remote sources on load with
+`AllowRemoteImages = false`, if the exported file must be self-contained.
 
 If you import SVG from elsewhere, sanitize it yourself. BlazorInk does not import SVG, and injecting arbitrary
 SVG into a page is a scripting risk regardless of this library.

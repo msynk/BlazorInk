@@ -241,6 +241,8 @@ public static class SvgExporter
             WriteLayer(writer, context, layer, state);
         }
 
+        // An element that opened a scope without closing it must not leave the document unbalanced.
+        context.CloseAll();
         writer.Write("</svg>");
     }
 

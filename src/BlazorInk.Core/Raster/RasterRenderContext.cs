@@ -43,7 +43,11 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
 
     private readonly record struct State(Matrix3x2 Transform, Rect Clip);
 
-    private readonly record struct GroupFrame(RasterSurface Surface, float Opacity, BlendMode Blend, Rect Clip);
+    /// <summary>
+    /// A group also remembers how deep the transform and clip stack was when it opened. Restoring to that depth
+    /// on close stops an unbalanced Save inside the group from leaking its clip into what follows.
+    /// </summary>
+    private readonly record struct GroupFrame(RasterSurface Surface, float Opacity, BlendMode Blend, Rect Clip, State State, int StateDepth);
 
     /// <summary>Creates a context drawing into a surface.</summary>
     /// <param name="surface">Target surface.</param>
@@ -80,7 +84,9 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
     /// <inheritdoc />
     public void Restore()
     {
-        if (_states.Count > 0) _state = _states.Pop();
+        // A Restore must not unwind past the group it is inside; that state belongs to the caller of PushGroup.
+        int floor = _groups.Count > 0 ? _groups.Peek().StateDepth : 0;
+        if (_states.Count > floor) _state = _states.Pop();
     }
 
     /// <inheritdoc />
@@ -175,13 +181,18 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
                 float u = crop.X + (document.X - destination.X) * scaleX;
                 float v = crop.Y + (document.Y - destination.Y) * scaleY;
                 (float r, float g, float b, float a) = SampleBilinear(source, u - 0.5f, v - 0.5f);
-                a *= opacity;
                 if (a <= 0.002f) continue;
-                _target.BlendPixel(x, y, r * a, g * a, b * a, a, BlendMode.Normal);
+                // Already premultiplied by the sampler; opacity scales colour and alpha together.
+                _target.BlendPixel(x, y, r * opacity, g * opacity, b * opacity, a * opacity, BlendMode.Normal);
             }
         }
     }
 
+    /// <summary>
+    /// Bilinear sample returning premultiplied colour. Interpolating straight colour would let a fully
+    /// transparent pixel contribute its stored colour, which shows up as a dark or coloured fringe on the edges
+    /// of an image with transparency.
+    /// </summary>
     private static (float R, float G, float B, float A) SampleBilinear(PngCodec.DecodedImage image, float x, float y)
     {
         int x0 = (int)MathF.Floor(x);
@@ -205,7 +216,8 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
         x = Math.Clamp(x, 0, image.Width - 1);
         y = Math.Clamp(y, 0, image.Height - 1);
         int offset = (y * image.Width + x) * 4;
-        return (image.Rgba[offset] / 255f, image.Rgba[offset + 1] / 255f, image.Rgba[offset + 2] / 255f, image.Rgba[offset + 3] / 255f);
+        float a = image.Rgba[offset + 3] / 255f;
+        return (image.Rgba[offset] / 255f * a, image.Rgba[offset + 1] / 255f * a, image.Rgba[offset + 2] / 255f * a, a);
     }
 
     private PngCodec.DecodedImage? GetImage(ImageSource image)
@@ -249,7 +261,7 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
         // Always isolate. Callers only open a group when they need it, and skipping the buffer here would let an
         // eraser stroke inside the group erase the background and the layers below it.
         var surface = new RasterSurface(_root.Width, _root.Height);
-        _groups.Push(new GroupFrame(_target, opacity, blend, _state.Clip));
+        _groups.Push(new GroupFrame(_target, opacity, blend, _state.Clip, _state, _states.Count));
         _target = surface;
     }
 
@@ -258,11 +270,17 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
     {
         if (_groups.Count == 0) return;
         GroupFrame frame = _groups.Pop();
+
+        // Discard anything the group left on the state stack and restore the transform and clip it opened with,
+        // so an element that forgot a Restore cannot affect what comes after the group.
+        while (_states.Count > frame.StateDepth) _states.Pop();
+        _state = frame.State;
+
         RasterSurface group = _target;
         _target = frame.Surface;
         _target.Composite(group, frame.Opacity, frame.Blend, frame.Clip);
     }
 
-    /// <summary>The surface being drawn into (the root surface unless a group is open).</summary>
+    /// <summary>The surface everything is ultimately composited onto.</summary>
     public RasterSurface Surface => _root;
 }

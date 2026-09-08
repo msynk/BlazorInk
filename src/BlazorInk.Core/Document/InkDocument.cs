@@ -185,6 +185,12 @@ public sealed class InkDocument
     {
         ArgumentNullException.ThrowIfNull(operation);
         if (operation is BatchOperation { IsEmpty: true }) return operation;
+
+        // Version numbers are decided before the operation is applied, so the operation reported to listeners
+        // carries the same version that ends up in the document. A collaborator receiving an operation whose
+        // version is lower than what the sender actually stored would discard it, and the two replicas would
+        // never agree again.
+        operation = AssignVersions(operation);
         DrawingOperation inverse = operation.ApplyCore(this);
         if (_batchDepth > 0)
         {
@@ -326,6 +332,39 @@ public sealed class InkDocument
         if (ops.Count > 0) Apply(new BatchOperation(ops, "Clear"));
     }
 
+    /// <summary>
+    /// Returns the operation with element versions filled in from the document's current state. Only replacements
+    /// need this: every other operation already carries whatever version its element should keep.
+    /// </summary>
+    private DrawingOperation AssignVersions(DrawingOperation operation)
+    {
+        switch (operation)
+        {
+            case ReplaceElementOperation replace when TryGetElement(replace.Element.Id, out InkElement? current):
+            {
+                if (replace.Element.Version > current.Version) return replace;
+                return new ReplaceElementOperation(replace.Element with { Version = current.Version + 1 });
+            }
+            case BatchOperation batch:
+            {
+                List<DrawingOperation>? rewritten = null;
+                for (int i = 0; i < batch.Operations.Count; i++)
+                {
+                    DrawingOperation assigned = AssignVersions(batch.Operations[i]);
+                    if (!ReferenceEquals(assigned, batch.Operations[i]) && rewritten is null)
+                    {
+                        rewritten = new List<DrawingOperation>(batch.Operations.Count);
+                        for (int j = 0; j < i; j++) rewritten.Add(batch.Operations[j]);
+                    }
+                    rewritten?.Add(assigned);
+                }
+                return rewritten is null ? batch : new BatchOperation(rewritten, batch.Label);
+            }
+            default:
+                return operation;
+        }
+    }
+
     // ---- Core mutations (called by operations) ------------------------------------------------------------------------
 
     internal void InsertElementCore(Guid layerId, InkElement element, int? index)
@@ -371,6 +410,8 @@ public sealed class InkDocument
             throw;
         }
 
+        // Apply assigned the version already; anything reaching here with a stale one is a direct caller, and is
+        // still bumped so two versions of an element are never confused.
         InkElement next = element.Version > previous.Version ? element : element with { Version = previous.Version + 1 };
         layer.MutableElements[index] = next;
         if (next is Stroke incoming) _totalPoints += incoming.Points.Count;

@@ -5,9 +5,10 @@
 A pointer event does not become a point directly. Between the two sits `StrokeBuilder`, which does four things,
 all without allocating:
 
-1. **Spacing filter.** Samples closer than `Brush.Spacing * Brush.Width` to the previous stored point are merged
-   into it and their pressure averaged. This removes sensor jitter and keeps documents small: a 240 Hz pen
-   produces far more samples than the shape needs.
+1. **Spacing filter.** A sample that would land closer than `Brush.Spacing * Brush.Width` to the previous stored
+   point, with a small floor so a zero spacing still filters duplicates, is merged into it and their pressure
+   averaged. This removes sensor jitter and keeps documents small: a 240 Hz pen produces far more samples than the
+   shape needs.
 2. **Streamline smoothing.** Each stored position is pulled toward the previous one by `Brush.Smoothing`. This is
    an exponential filter, so it removes hand tremor without adding lag on straight sections.
 3. **Pressure.** Real pen pressure is lightly smoothed. When the device has none, and the brush asks for it,

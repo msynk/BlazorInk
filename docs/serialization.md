@@ -53,8 +53,9 @@ and only documented fields.
 as zigzag varints. Pressure is one byte, time is a varint delta in milliseconds, and tilt and twist are only
 present when the device produced them.
 
-A handwriting point costs about 4 to 6 bytes, against 30 or more for a JSON number array. The encoding is
-deterministic: the same points always produce the same bytes, so documents can be compared and diffed.
+A handwriting point costs about 3 to 6 bytes depending on how fast the pen was moving, against 30 or more for a
+JSON number array. The encoding is deterministic: the same points always produce the same bytes, so documents can
+be compared and diffed.
 
 For a readable file, ask for JSON points:
 
@@ -82,7 +83,7 @@ Loading is a parser attack surface. Everything is validated:
 | Input size | `MaxInputBytes`, 256 MB by default, checked before parsing |
 | Layers, elements | `DocumentLimits.MaxLayers`, `MaxElements` |
 | Points per stroke, total points | `MaxPointsPerStroke`, `MaxTotalPoints` |
-| Coordinates | `MaxCoordinate`, rejected rather than clamped |
+| Coordinates | `MaxCoordinate`, checked against every element's bounds and rejected rather than clamped |
 | Brush width | `MaxStrokeWidth` |
 | Image URIs | scheme and media type allowlist; SVG and remote images are opt-in |
 | Font families | restricted character set, because the value reaches CSS and SVG |
@@ -108,8 +109,11 @@ Measured on a synthetic handwriting document of 10,000 strokes with 60 points ea
 
 | Encoding | Size |
 | --- | --- |
-| Compact, base64 binary points | about 5 MB, roughly 8 bytes per point including all JSON overhead |
-| Readable, JSON number arrays | roughly five times larger |
+| Compact, base64 binary points | about 8 bytes per point including base64 expansion and all JSON overhead |
+| Readable, JSON number arrays | several times larger |
+
+The collaboration benchmark asserts the compact figure: a stroke costs under 14 bytes per point on the wire,
+including the operation wrapper.
 
 ## Custom data
 
@@ -125,4 +129,5 @@ document.ReplaceElement(stroke with
 });
 ```
 
-`Description` is also what the canvas reports to assistive technology and what SVG export writes as a `<title>`.
+`Description` is what the canvas reports to assistive technology, and what SVG export writes as a `title`
+element when `IncludeElementDescriptions` is set. Elements without one fall back to a structural summary.

@@ -24,8 +24,8 @@ actually changed.
 every export.
 
 **Bounds never build geometry.** Asking an element for its bounds returns a conservative estimate from the brush
-until the exact outline exists. Loading a document reads the bounds of every element; building every outline up
-front cost five times the memory and twice the time before this was fixed.
+until the exact outline exists. Loading a document reads the bounds of every element, so building every outline up
+front made loading far slower and allocated far more; the load figures below are what it costs now.
 
 **Culling.** A redraw records only the elements whose bounds intersect the visible rectangle.
 
@@ -79,10 +79,15 @@ Document of 10,000 strokes, 600,000 points:
 
 | Operation | Time | Allocated |
 | --- | --- | --- |
-| Save | 26 ms | 22 MB |
+| Save | 28 ms | 22 MB |
 | Load | 72 ms | 23 MB |
 | Encode 10,000 points | 81 us | 101 KB |
 | Decode 10,000 points | 55 us | 156 KB |
+| Export SVG | 569 ms | 150 MB |
+
+SVG export is the expensive one, and inherently so: 600,000 points become about 35 million characters of path
+data. Most of that memory is the string itself, twice over, because `Export` returns one. Use the streaming
+overload for documents this size and the second copy disappears.
 
 ### Hit testing
 

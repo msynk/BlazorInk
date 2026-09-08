@@ -60,6 +60,9 @@ using (document.BeginBatch("Import"))
 }
 ```
 
+A scope collects changes that have already been applied, so an exception inside it leaves the successful ones in
+place. Apply a `BatchOperation` directly when the change must be all or nothing.
+
 The operation set is deliberately closed. Custom behaviour composes the existing operations rather than adding
 new ones, which keeps undo, serialization and synchronization correct for every editor built on the library.
 
@@ -84,8 +87,10 @@ yours. Undo and redo are re-broadcast to collaborators as ordinary edits, becaus
 | `SvgRenderContext` | Writes SVG markup. Paths stay paths. |
 | `RasterRenderContext` | Draws into a pixel buffer with the built-in anti-aliased rasterizer. |
 
-`DocumentRenderer.Render` walks the document once and calls the context. Because the screen, SVG export and PNG
-export all go through it, an exported file cannot drift from what was drawn.
+`DocumentRenderer.Render` walks the document once and calls the context. The canvas and the rasterizer both go
+through it, so what is on screen and what a PNG contains cannot drift apart. SVG export walks the document
+itself, because it has to turn eraser strokes into masks rather than replaying them as sequential compositing;
+it draws every element through the same `IRenderContext`, so element geometry is identical.
 
 Layers that contain an eraser stroke, or that have opacity below 1, are drawn inside an isolated group so erasing
 cannot reach the layers below. On canvas that is a scratch bitmap; in SVG it becomes a mask; in the rasterizer it
@@ -93,11 +98,16 @@ is a separate surface.
 
 ## The browser bridge
 
-`blazorink.js` contains no drawing logic. It does three things:
+`blazorink.js` contains no stroke model, no smoothing and no geometry. It does four things:
 
 1. Collects pointer samples, including coalesced ones, and hands them to .NET once per animation frame.
-2. Replays a command buffer of numbers onto a 2D canvas.
-3. Reports capabilities, sizes and encoded image data.
+2. Forwards keyboard input on the same path, so a keystroke never triggers a Blazor render.
+3. Replays a command buffer of numbers onto a 2D canvas.
+4. Reports capabilities, sizes and encoded image data.
+
+It draws exactly one thing itself: the provisional trail described in [hosting models](hosting-models.md), a
+constant-width polyline used under Blazor Server to hide the round trip. It carries no stroke model and is
+replaced by the engine's geometry as soon as .NET responds.
 
 In WebAssembly the command buffer reaches JavaScript through `[JSImport]` as a view over managed memory, so a
 redraw is one call with no serialization. Everywhere else the same buffer travels through `IJSRuntime`.

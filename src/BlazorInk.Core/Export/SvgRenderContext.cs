@@ -17,8 +17,19 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
 {
     private readonly TextWriter _writer;
     private readonly int _decimals;
-    private readonly Stack<string> _closeTags = new();
+
+    // Save and PushGroup both open markup, but Restore and PopGroup must unwind their own kind. Tagging each
+    // frame keeps them from consuming each other's, which would leave the document unbalanced.
+    private readonly Stack<Frame> _frames = new();
     private int _clipCounter;
+    private int _skippedErasers;
+
+    private sealed class Frame(bool isGroup)
+    {
+        public bool IsGroup { get; } = isGroup;
+
+        public string CloseTags { get; set; } = string.Empty;
+    }
 
     /// <summary>Creates a context writing into <paramref name="writer"/>.</summary>
     /// <param name="writer">Destination for the SVG fragment.</param>
@@ -58,15 +69,22 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
         return true;
     }
 
+    /// <summary>
+    /// Number of erase operations that were skipped. Erasing cannot be expressed by a paint attribute in SVG; the
+    /// document exporter turns eraser strokes into masks, and anything that reaches this context directly is
+    /// counted here rather than being painted as solid colour.
+    /// </summary>
+    public int SkippedErasers => _skippedErasers;
+
     /// <inheritdoc />
-    public void Save() => _closeTags.Push(string.Empty);
+    public void Save() => _frames.Push(new Frame(isGroup: false));
 
     /// <inheritdoc />
     public void Restore()
     {
-        if (_closeTags.Count == 0) return;
-        string tags = _closeTags.Pop();
-        if (tags.Length > 0) _writer.Write(tags);
+        // Only unwind up to the nearest group boundary: a Restore must never close a group someone else opened.
+        if (_frames.Count == 0 || _frames.Peek().IsGroup) return;
+        _writer.Write(_frames.Pop().CloseTags);
     }
 
     /// <inheritdoc />
@@ -114,6 +132,13 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
     {
         ArgumentNullException.ThrowIfNull(path);
         if (path.IsEmpty || paint.EffectiveAlpha <= 0) return;
+        if (paint.Blend == BlendMode.DestinationOut)
+        {
+            // Painting this would draw solid colour where the user expects an erasure, which is worse than
+            // leaving it out. SvgExporter handles erasers properly, as masks.
+            _skippedErasers++;
+            return;
+        }
         _writer.Write("<path d=\"");
         path.WriteSvgPathData(_writer, _decimals);
         _writer.Write("\" fill=\"");
@@ -130,6 +155,11 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
     {
         ArgumentNullException.ThrowIfNull(path);
         if (path.IsEmpty || paint.EffectiveAlpha <= 0 || paint.Width <= 0) return;
+        if (paint.Blend == BlendMode.DestinationOut)
+        {
+            _skippedErasers++;
+            return;
+        }
         _writer.Write("<path d=\"");
         path.WriteSvgPathData(_writer, _decimals);
         _writer.Write("\" fill=\"none\" stroke=\"");
@@ -166,6 +196,10 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
             float scaleX = destination.Width / crop.Width;
             float scaleY = destination.Height / crop.Height;
             var full = new Rect(destination.X - crop.X * scaleX, destination.Y - crop.Y * scaleY, image.Width * scaleX, image.Height * scaleY);
+
+            // The clip needs a scope of its own. Without the Save, the matching Restore would close whatever
+            // scope the caller had open, and every later element would fall outside its layer group.
+            Save();
             ClipRect(destination);
             WriteImageTag(image, full, opacity);
             Restore();
@@ -245,14 +279,23 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
             _writer.Write(" style=\"isolation:isolate\"");
         }
         _writer.Write('>');
-        _closeTags.Push("</g>");
+        _frames.Push(new Frame(isGroup: true) { CloseTags = "</g>" });
     }
 
     /// <inheritdoc />
     public void PopGroup()
     {
-        if (_closeTags.Count == 0) return;
-        _writer.Write(_closeTags.Pop());
+        // Close any scopes an element left open before closing the group itself, so the markup stays balanced
+        // even when a caller's Save and Restore are not perfectly paired.
+        while (_frames.Count > 0 && !_frames.Peek().IsGroup) _writer.Write(_frames.Pop().CloseTags);
+        if (_frames.Count == 0) return;
+        _writer.Write(_frames.Pop().CloseTags);
+    }
+
+    /// <summary>Closes every scope still open, so a partially written fragment is still well formed.</summary>
+    public void CloseAll()
+    {
+        while (_frames.Count > 0) _writer.Write(_frames.Pop().CloseTags);
     }
 
     /// <summary>Writes a raw group open tag with the given attributes. Used by the document exporter for layers and masks.</summary>
@@ -261,18 +304,20 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
     /// <summary>Writes raw markup. Callers are responsible for escaping.</summary>
     internal void WriteRaw(string markup) => _writer.Write(markup);
 
+    /// <summary>
+    /// Records markup that must be closed. It attaches to the innermost scope, so the matching Restore or
+    /// PopGroup closes everything opened after it, in the right order.
+    /// </summary>
     private void PushClose(string tag)
     {
-        // Attach to the innermost Save() scope so Restore() closes everything opened after it.
-        if (_closeTags.Count > 0)
+        if (_frames.Count > 0 && !_frames.Peek().IsGroup)
         {
-            string existing = _closeTags.Pop();
-            _closeTags.Push(tag + existing);
+            Frame frame = _frames.Peek();
+            frame.CloseTags = tag + frame.CloseTags;
+            return;
         }
-        else
-        {
-            _closeTags.Push(tag);
-        }
+        // No open Save scope: the tag becomes a scope of its own so it is still closed eventually.
+        _frames.Push(new Frame(isGroup: false) { CloseTags = tag });
     }
 
     private void WriteOpacity(string attribute, float value)

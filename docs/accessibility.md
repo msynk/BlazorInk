@@ -47,8 +47,8 @@ document.AddElement(new LineShape(a, b) { EndArrow = true, Description = "Arrow 
 ```
 
 Elements without a description fall back to something structural, such as "Stroke, 142 points, pen brush, colour
-#111827", and text elements report their text. `IncludeElementDescriptions` carries them into exported SVG as
-`title` elements.
+#111827", and text elements report their text. Exported SVG carries the same strings as `title` elements when
+`IncludeElementDescriptions` is set.
 
 ## Keyboard
 

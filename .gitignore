@@ -427,3 +427,6 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# Benchmark output
+BenchmarkDotNet.Artifacts/

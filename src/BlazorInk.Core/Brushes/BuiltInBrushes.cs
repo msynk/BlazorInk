@@ -12,7 +12,7 @@ public sealed record PenBrush : Brush
     /// <summary>The serialized kind: <c>pen</c>.</summary>
     public const string KindName = "pen";
 
-    /// <summary>Creates a pen with sensible defaults (black, 4 units wide, ease-in pressure curve).</summary>
+    /// <summary>Creates a pen with sensible defaults: black, 4 units wide, the S-curve pressure response.</summary>
     public PenBrush()
     {
         Width = 4f;

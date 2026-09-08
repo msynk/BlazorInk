@@ -3,8 +3,10 @@
 A native drawing and ink engine for Blazor.
 
 The stroke model, smoothing, pressure response, hit testing, undo, serialization and export are written in C#.
-JavaScript does only what the browser alone can do: collect pointer events and replay a command buffer onto a
-canvas. There is no JavaScript drawing library underneath.
+JavaScript does only what the browser alone can do: collect pointer and keyboard input, and replay a command
+buffer onto a canvas. There is no JavaScript drawing library underneath. The one drawing JavaScript does is a
+provisional trail under Blazor Server, described in [hosting models](docs/hosting-models.md), which exists to
+hide network latency and is replaced by the engine's own geometry.
 
 ```razor
 <InkCanvas @ref="canvas" Height="200px" AriaLabel="Signature" />
@@ -60,9 +62,9 @@ Pointer events (browser)
   -> IRenderContext     canvas commands, SVG, or the built-in rasterizer
 ```
 
-One rendering path serves the screen, SVG export and PNG export, so an exported file always matches what was
-drawn. Pointer input never triggers a Blazor render: samples arrive once per frame, the active tool processes
-them, and only the affected canvas layer is redrawn.
+Every renderer draws the same elements through the same `IRenderContext` interface, so an exported file matches
+what was drawn. Pointer input never triggers a Blazor render: samples arrive once per frame, the active tool
+processes them, and only the affected canvas layer is redrawn.
 
 ## Documentation
 

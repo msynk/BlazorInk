@@ -19,8 +19,9 @@ public enum CollaborationMessageKind : byte
 }
 
 /// <summary>
-/// One message exchanged between participants. Messages are self-contained and idempotent by
-/// <see cref="Sequence"/>, so a transport may retry or reorder them.
+/// One message exchanged between participants. Messages are self-contained, and <see cref="Sequence"/> makes
+/// them idempotent: a retried message is applied once. A message that arrives after a later one from the same
+/// sender is discarded, so a transport must deliver each sender's messages in order.
 /// </summary>
 public sealed record CollaborationMessage
 {
@@ -30,7 +31,10 @@ public sealed record CollaborationMessage
     /// <summary>Who sent it.</summary>
     public required string SenderId { get; init; }
 
-    /// <summary>The sender's own message counter, used to drop duplicates and detect gaps.</summary>
+    /// <summary>
+    /// The sender's own message counter. A message whose sequence is not greater than the last one seen from
+    /// that sender is discarded as a duplicate or a late arrival.
+    /// </summary>
     public long Sequence { get; init; }
 
     /// <summary>The document the message applies to.</summary>
@@ -100,8 +104,9 @@ public sealed record PresenceState
 /// session makes no assumptions beyond eventual delivery.
 /// </summary>
 /// <remarks>
-/// The transport is responsible for delivery and for excluding the sender from its own broadcasts. It does not
-/// need to guarantee ordering: the session tolerates reordering and duplicates.
+/// The transport is responsible for delivery and for excluding the sender from its own broadcasts. It must
+/// deliver each sender's messages in order; a message that arrives after a later one from the same sender is
+/// discarded. Duplicates are harmless. Ordering between different senders does not matter.
 /// </remarks>
 public interface ICollaborationTransport
 {

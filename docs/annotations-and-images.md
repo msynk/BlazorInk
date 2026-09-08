@@ -24,8 +24,10 @@ Interactively, `ShapeTool` draws them:
 
 ```csharp
 var tool = new ShapeTool(ShapeKind.Arrow);   // Rectangle, Ellipse, Line, Arrow, Highlight
-tool.SetConstrain(shiftHeld);                // squares, circles, 15-degree angles
 ```
+
+Holding Shift while dragging constrains to a square, a circle or a 15-degree angle. The modifier travels with the
+pointer samples, so it works with a pen and a touch keyboard as well as a mouse.
 
 ## Highlights
 
@@ -99,6 +101,7 @@ bounds; the browser still lays the text out for real when drawing.
 ```csharp
 var source = ImageSource.FromBytes(pngBytes, "image/png", width: 640, height: 400);
 ImageElement? image = await canvas.AddImageAsync(source, position: null, maxWidth: 800f);
+// null when the canvas is read-only; it is already in the document otherwise
 ```
 
 `AddImageAsync` asks the browser for the natural size when it is unknown, scales the image to `maxWidth`, and
@@ -124,7 +127,7 @@ Put the image on its own layer and lock it:
 
 ```csharp
 Guid imageLayer = document.Layers[0].Id;
-document.AddElement(image, imageLayer);
+document.AddElement(new ImageElement(source, new Rect(0, 0, 640, 400)), imageLayer);
 document.UpdateLayer(imageLayer, p => p with { IsLocked = true, Name = "Image" });
 
 Guid annotations = document.AddLayer("Annotations").Id;

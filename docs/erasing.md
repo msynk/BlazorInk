@@ -66,8 +66,9 @@ var tool = new DrawTool { HonorPenEraserButton = false };   // to opt out
 
 ## Erasing and undo
 
-A whole erase gesture is one undo step, however many strokes it touched. `EraserTool` opens a history group on
-pointer down and closes it on pointer up. Erasing nothing creates no history entry at all.
+A whole erase gesture is one undo step, however many strokes it touched. In stroke and segment mode the tool
+opens a history group on pointer down and closes it on pointer up, and erasing nothing creates no entry at all.
+Pixel mode needs no group: the gesture produces a single eraser stroke, which is already one step.
 
 ## Layers
 

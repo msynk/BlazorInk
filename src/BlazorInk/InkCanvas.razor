@@ -1,5 +1,6 @@
 @namespace BlazorInk
 @using BlazorInk.Tools
+@using Microsoft.AspNetCore.Components.Web
 @inherits Microsoft.AspNetCore.Components.ComponentBase
 
 <div @ref="_container"
@@ -11,7 +12,6 @@
      aria-describedby="@($"{ElementId}-desc")"
      aria-disabled="@(ReadOnly ? "true" : null)"
      tabindex="@(Focusable ? 0 : -1)"
-     @onkeydown="OnKeyDownAsync"
      @attributes="AdditionalAttributes">
 
     <canvas data-bi-layer="document" class="blazorink-layer blazorink-document" aria-hidden="true"></canvas>

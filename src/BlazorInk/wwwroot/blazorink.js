@@ -101,8 +101,13 @@ class Surface {
     this.activePointers = new Set();
     this.penActive = false;
     this.disposed = false;
-    this.wetInk = null;
+    this.wetInk = new Map();
     this.images = new Map();
+    this.frameToken = 0;
+    this.rectFrame = -1;
+    this.cachedRect = null;
+    this.pixelRatioQuery = null;
+    this.onPixelRatioChange = null;
     this.groupStack = [];
     this.scratchCanvases = [];
 
@@ -154,12 +159,23 @@ class Surface {
     const listen = () => {
       if (this.disposed) return;
       this.pixelRatioQuery = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-      this.pixelRatioQuery.addEventListener('change', () => {
+      // Kept in a field so dispose can detach it: a media query listener is registered on the document and
+      // would keep this surface, its canvases and its image cache alive until the ratio happened to change.
+      this.onPixelRatioChange = () => {
         this.notifyResize();
         listen();
-      }, { once: true });
+      };
+      this.pixelRatioQuery.addEventListener('change', this.onPixelRatioChange, { once: true });
     };
     listen();
+  }
+
+  stopWatchingPixelRatio() {
+    if (this.pixelRatioQuery && this.onPixelRatioChange) {
+      this.pixelRatioQuery.removeEventListener('change', this.onPixelRatioChange);
+    }
+    this.pixelRatioQuery = null;
+    this.onPixelRatioChange = null;
   }
 
   setSize(cssWidth, cssHeight, dpr) {
@@ -194,13 +210,23 @@ class Surface {
     return false;
   }
 
+  // The element rectangle is read once per event rather than once per sample: getBoundingClientRect forces a
+  // layout, and a 240 Hz pen delivers dozens of coalesced samples per event.
+  currentRect() {
+    if (this.rectFrame !== this.frameToken) {
+      this.cachedRect = this.hitTarget.getBoundingClientRect();
+      this.rectFrame = this.frameToken;
+    }
+    return this.cachedRect;
+  }
+
   push(event, phase, flags) {
     if (this.sampleCount * SAMPLE_SIZE + SAMPLE_SIZE > this.samples.length) {
       const grown = new Float64Array(this.samples.length * 2);
       grown.set(this.samples);
       this.samples = grown;
     }
-    const rect = this.hitTarget.getBoundingClientRect();
+    const rect = this.currentRect();
     const o = this.sampleCount * SAMPLE_SIZE;
     const s = this.samples;
     s[o] = event.pointerId;
@@ -271,7 +297,7 @@ class Surface {
     if (event.pointerType === 'pen') this.penActive = false;
     try { this.hitTarget.releasePointerCapture(event.pointerId); } catch { /* already released */ }
     this.push(event, PHASE_UP, 0);
-    this.endWetInk();
+    this.endWetInk(event.pointerId);
     this.requestFlush();
   }
 
@@ -279,7 +305,7 @@ class Surface {
     if (!this.activePointers.delete(event.pointerId)) return;
     if (event.pointerType === 'pen') this.penActive = false;
     this.push(event, PHASE_CANCEL, 0);
-    this.endWetInk();
+    this.endWetInk(event.pointerId);
     this.requestFlush();
   }
 
@@ -320,6 +346,8 @@ class Surface {
   }
 
   requestFlush() {
+    // A new frame invalidates the cached element rectangle: the page may have scrolled or resized.
+    this.frameToken++;
     if (this.frameRequested || this.disposed) return;
     this.frameRequested = true;
     requestAnimationFrame(this.onFrame);
@@ -328,9 +356,11 @@ class Surface {
   // Delivers one batch of samples per animation frame. Never one call per pointer event.
   flush() {
     this.frameRequested = false;
-    if (this.disposed || !this.callback || this.sampleCount === 0) return;
     const count = this.sampleCount;
+    // Cleared unconditionally: samples collected before .NET attached its callback, or after a circuit dropped,
+    // would otherwise accumulate for ever and grow the buffer without bound.
     this.sampleCount = 0;
+    if (this.disposed || !this.callback || count === 0) return;
     this.callback.samples(this.samples, count);
   }
 
@@ -342,11 +372,13 @@ class Surface {
   appendWetInk(event) {
     const ctx = this.contexts.overlay;
     if (!ctx || !this.wetInkStyle) return;
-    const rect = this.hitTarget.getBoundingClientRect();
+    const rect = this.currentRect();
     const x = event.clientX - rect.left;
     const y = event.clientY - rect.top;
-    if (!this.wetInk) {
-      this.wetInk = { x, y };
+    // Tracked per pointer, so a second contact does not draw a line from where the first one was.
+    const previous = this.wetInk.get(event.pointerId);
+    if (!previous) {
+      this.wetInk.set(event.pointerId, { x, y });
       return;
     }
     ctx.save();
@@ -357,15 +389,16 @@ class Surface {
     ctx.lineJoin = 'round';
     ctx.globalAlpha = this.wetInkStyle.opacity;
     ctx.beginPath();
-    ctx.moveTo(this.wetInk.x, this.wetInk.y);
+    ctx.moveTo(previous.x, previous.y);
     ctx.lineTo(x, y);
     ctx.stroke();
     ctx.restore();
-    this.wetInk = { x, y };
+    this.wetInk.set(event.pointerId, { x, y });
   }
 
-  endWetInk() {
-    this.wetInk = null;
+  endWetInk(pointerId) {
+    if (pointerId === undefined) this.wetInk.clear();
+    else this.wetInk.delete(pointerId);
   }
 
   setWetInkStyle(style) {
@@ -374,17 +407,28 @@ class Surface {
 
   // ---- Command replay ----------------------------------------------------------------------------------------
 
-  getScratch() {
-    const canvas = this.scratchCanvases.pop();
-    if (canvas && canvas.width === this.documentCanvas.width && canvas.height === this.documentCanvas.height) return canvas;
+  // The scratch canvas must be the size of whatever is being drawn into. Sizing it from the on-screen canvas
+  // would crop every isolated layer when exporting at a different resolution.
+  getScratch(width, height) {
+    for (let i = this.scratchCanvases.length - 1; i >= 0; i--) {
+      const candidate = this.scratchCanvases[i];
+      if (candidate.width === width && candidate.height === height) {
+        this.scratchCanvases.splice(i, 1);
+        return candidate;
+      }
+    }
     const created = document.createElement('canvas');
-    created.width = this.documentCanvas.width;
-    created.height = this.documentCanvas.height;
+    created.width = width;
+    created.height = height;
     return created;
   }
 
   releaseScratch(canvas) {
     if (this.scratchCanvases.length < 4) this.scratchCanvases.push(canvas);
+  }
+
+  clearScratch() {
+    this.scratchCanvases.length = 0;
   }
 
   execute(layer, buffer, count, strings) {
@@ -552,10 +596,15 @@ class Surface {
           const blend = commands[i++];
           // An isolated group needs its own bitmap: canvas composite operations always apply to the whole
           // surface, so an eraser inside a group would otherwise reach content drawn before it.
-          const scratch = this.getScratch();
+          const scratch = this.getScratch(ctx.canvas.width, ctx.canvas.height);
           const scratchCtx = scratch.getContext('2d');
-          scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
-          scratchCtx.clearRect(0, 0, scratch.width, scratch.height);
+          // A pooled context can carry a clip region or an unbalanced save from an earlier group.
+          if (typeof scratchCtx.reset === 'function') {
+            scratchCtx.reset();
+          } else {
+            scratchCtx.setTransform(1, 0, 0, 1, 0, 0);
+            scratchCtx.clearRect(0, 0, scratch.width, scratch.height);
+          }
           scratchCtx.setTransform(ctx.getTransform());
           groups.push({ parent: ctx, canvas: scratch, opacity, blend });
           ctx = scratchCtx;
@@ -607,7 +656,7 @@ class Surface {
 
   measureText(text, font) {
     const ctx = this.contexts.document || this.contexts.overlay;
-    if (!ctx) return { width: 0, height: 0 };
+    if (!ctx) return { width: 0, lines: 1 };
     ctx.save();
     ctx.font = font;
     let width = 0;
@@ -633,6 +682,7 @@ class Surface {
     this.root.removeEventListener('keydown', this.onKeyDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
     this.resizeObserver?.disconnect();
+    this.stopWatchingPixelRatio();
     this.images.clear();
     this.scratchCanvases.length = 0;
     this.callback = null;

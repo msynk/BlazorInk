@@ -30,8 +30,8 @@ namespace BlazorInk;
 /// &lt;InkCanvas @ref="canvas" Width="400px" Height="180px" AriaLabel="Signature" /&gt;
 /// @code {
 ///     private InkCanvas? canvas;
-///     private Task ClearAsync() =&gt; canvas!.ClearAsync();
-///     private Task&lt;string&gt; SaveAsync() =&gt; canvas!.ExportSvgAsync();
+///     private void Clear() =&gt; canvas!.Clear();
+///     private string Save() =&gt; canvas!.ExportSvg();
 /// }
 /// </code>
 /// </example>
@@ -1071,12 +1071,15 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         foreach (InkElement element in _document.AllElements)
         {
             if (described.Count >= maxDescribed) break;
-            if (element.Description is { Length: > 0 } description) described.Add(description);
-            else if (element is TextElement text && text.Text.Length > 0) described.Add("Text: " + text.Text);
+            // Every element contributes something: its own description when the application supplied one, and
+            // otherwise the structural summary the element knows how to produce.
+            described.Add(element.GetAccessibleDescription());
         }
 
         string summary = $"Drawing with {total} elements on {_document.Layers.Count} layers.";
-        return described.Count == 0 ? summary : summary + " " + string.Join(". ", described) + ".";
+        if (described.Count == 0) return summary;
+        string listed = summary + " " + string.Join(". ", described) + ".";
+        return total > described.Count ? listed + $" {total - described.Count} more elements not listed." : listed;
     }
 
     /// <inheritdoc />

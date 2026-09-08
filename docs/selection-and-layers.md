@@ -55,8 +55,10 @@ List<InkElement> all = DocumentQuery.HitTestAll(document, point);
 List<InkElement> inside = DocumentQuery.FindInRect(document, rect, RectSelectionMode.Contain);
 ```
 
-Hit testing is geometric, not bounding-box based: a diagonal stroke is not selected by a marquee that only
-overlaps its bounding box.
+Hit testing is geometric for strokes and shapes: a diagonal stroke is not selected by a marquee that only
+overlaps its bounding box, and clicking inside the empty middle of an unfilled rectangle does not select it.
+Text, images and highlights are rectangular by nature and are tested against their bounds.
+`RectSelectionMode.Contain` compares bounding boxes, because "entirely inside" is a question about extent.
 
 ## Layers
 
