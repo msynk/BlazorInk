@@ -389,4 +389,82 @@ public class CollaborationSessionTests
 
         Assert.Equal(1, document.ElementCount);
     }
+
+    [Fact]
+    public async Task A_participant_that_leaves_is_forgotten_and_can_rejoin_with_the_same_id()
+    {
+        var hub = new TestHub();
+        var document = new InkDocument();
+        TestTransport transport = hub.CreateClient();
+        await using var session = new CollaborationSession(document, transport, "local");
+        TestTransport peer = hub.CreateClient();
+
+        await peer.SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Presence,
+            SenderId = "peer",
+            DocumentId = document.Id,
+            Sequence = 7,
+            Presence = new PresenceState { ParticipantId = "peer", Name = "Peer" },
+        });
+        await Task.Yield();
+        Assert.Single(session.Participants);
+
+        await peer.SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Leave,
+            SenderId = "peer",
+            DocumentId = document.Id,
+            Sequence = 8,
+        });
+        await Task.Yield();
+        Assert.Empty(session.Participants);
+
+        // Rejoining restarts at sequence 1. If the de-duplication cursor had survived the leave, every message
+        // from the returning participant would be discarded as a retransmission and they would appear frozen.
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(20, 20));
+        await peer.SendAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Operation,
+            SenderId = "peer",
+            DocumentId = document.Id,
+            Sequence = 1,
+            Operation = OperationCodec.Serialize(new AddElementOperation(document.Layers[0].Id, stroke)),
+        });
+        await Task.Yield();
+
+        Assert.Equal(1, document.ElementCount);
+    }
+
+    [Fact]
+    public async Task A_change_made_while_the_queue_is_draining_does_not_overtake_it()
+    {
+        var hub = new TestHub();
+        var document = new InkDocument();
+        TestTransport transport = hub.CreateClient();
+        var received = new List<CollaborationMessage>();
+
+        TestTransport peer = hub.CreateClient();
+        peer.MessageReceived += m => { received.Add(m); return Task.CompletedTask; };
+
+        await using var session = new CollaborationSession(document, transport, "local");
+
+        transport.SetConnected(false);
+        document.AddElement(TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10)));
+        document.AddElement(TestData.Stroke(new Vector2(20, 0), new Vector2(30, 10)));
+        Assert.Equal(2, session.PendingCount);
+
+        transport.SetConnected(true);
+        document.AddElement(TestData.Stroke(new Vector2(40, 0), new Vector2(50, 10)));
+        await session.FlushAsync();
+        await Task.Yield();
+
+        Assert.Equal(0, session.PendingCount);
+        long[] sequences = received
+            .Where(m => m.Kind == CollaborationMessageKind.Operation)
+            .Select(m => m.Sequence)
+            .ToArray();
+        Assert.Equal(3, sequences.Length);
+        Assert.Equal(sequences.OrderBy(x => x).ToArray(), sequences);
+    }
 }

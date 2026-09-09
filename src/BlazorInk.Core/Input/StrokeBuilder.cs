@@ -35,7 +35,6 @@ public sealed class StrokeBuilder
     private PointerKind _kind;
     private int _pointerId = -1;
     private Matrix3x2 _viewToDocument = Matrix3x2.Identity;
-    private float _viewScale = 1f;
 
     /// <summary>True while a stroke is in progress.</summary>
     public bool IsActive { get; private set; }
@@ -74,8 +73,6 @@ public sealed class StrokeBuilder
         _points.Clear();
         _brush = brush;
         _viewToDocument = viewToDocument;
-        _viewScale = MathF.Sqrt(MathF.Abs(viewToDocument.GetDeterminant()));
-        if (_viewScale <= 0 || !float.IsFinite(_viewScale)) _viewScale = 1f;
         _startTime = sample.Timestamp;
         _lastTime = sample.Timestamp;
         _kind = sample.Kind;

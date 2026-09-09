@@ -56,6 +56,16 @@ public static class StrokeOutliner
     private const float MaxMiterScale = 1.6f;
     private const int MaxArcSteps = 12;
 
+    /// <summary>Most extra samples one segment contributes to a taper, so a very long segment stays bounded.</summary>
+    private const int MaxTaperSamples = 24;
+
+    /// <summary>
+    /// Point capacity kept between strokes. The scratch lists are reused so an ordinary stroke allocates nothing,
+    /// but one enormous stroke must not pin its buffer for the life of the thread: on a server that is once per
+    /// thread-pool thread that ever drew.
+    /// </summary>
+    private const int RetainedCapacity = 4096;
+
     [ThreadStatic]
     private static List<Vector2>? t_left;
     [ThreadStatic]
@@ -80,7 +90,17 @@ public static class StrokeOutliner
         ReadOnlySpan<Vector2> poly = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(polygon);
         if (options.Smooth) builder.AddSmoothPolygon(poly);
         else builder.AddPolygon(poly);
-        return GeometryMath.Bounds(poly);
+        Rect bounds = GeometryMath.Bounds(poly);
+        Trim();
+        return bounds;
+    }
+
+    /// <summary>Releases scratch buffers that one very large stroke grew, keeping the ordinary-case capacity.</summary>
+    private static void Trim()
+    {
+        if (t_polygon is { Capacity: > RetainedCapacity }) t_polygon = null;
+        if (t_left is { Capacity: > RetainedCapacity }) t_left = null;
+        if (t_right is { Capacity: > RetainedCapacity }) t_right = null;
     }
 
     /// <summary>Computes the raw outline polygon (no smoothing) for a set of points.</summary>
@@ -110,6 +130,14 @@ public static class StrokeOutliner
         left.Clear();
         right.Clear();
 
+        // Taper is a function of distance along the stroke, but the outline can only be evaluated at the points
+        // that are stored. A committed stroke is simplified, so a straight run is often just two points hundreds
+        // of units apart: evaluating the taper only at those turns a taper meant for the last few units into a
+        // wedge down the whole stroke. Segments that cross a taper zone are sampled along their length instead.
+        bool tapered = options.TaperStart > 0 || options.TaperEnd > 0;
+        float taperStartEnds = options.TaperStart;
+        float taperEndBegins = totalLength - options.TaperEnd;
+
         float distance = 0f;
         Vector2 prev = points.PositionAt(0);
         Vector2 prevDir = Vector2.Zero;
@@ -135,6 +163,7 @@ public static class StrokeOutliner
         for (int i = 0; i < n; i++)
         {
             Vector2 p = points.PositionAt(i);
+            float previousDistance = distance;
             if (i > 0) distance += Vector2.Distance(prev, p);
 
             Vector2 dirIn = prevDir;
@@ -148,6 +177,48 @@ public static class StrokeOutliner
             {
                 Vector2 d = GeometryMath.SafeNormalize(points.PositionAt(j) - p);
                 if (d != Vector2.Zero) { dirOut = d; break; }
+            }
+
+            // Fill in the taper along the segment that led here, before this point's own offsets are added.
+            if (i > 0 && tapered)
+            {
+                Vector2 segmentDirection = GeometryMath.SafeNormalize(p - prev);
+                float segmentSpan = distance - previousDistance;
+                if (segmentDirection != Vector2.Zero && segmentSpan > GeometryMath.Epsilon)
+                {
+                    Vector2 normal = GeometryMath.Perpendicular(segmentDirection);
+                    float fromPressure = points.Pressure[i - 1];
+                    float toPressure = points.Pressure[i];
+
+                    // Two zones: the taper in at the start of the stroke and the taper out at its end. Samples go
+                    // where the taper actually varies rather than being spread over the segment, because a segment
+                    // can be hundreds of units long while the zone it crosses is only a few.
+                    for (int zone = 0; zone < 2; zone++)
+                    {
+                        float zoneFrom = zone == 0 ? 0f : taperEndBegins;
+                        float zoneTo = zone == 0 ? taperStartEnds : totalLength;
+                        float from = MathF.Max(zoneFrom, previousDistance);
+                        float to = MathF.Min(zoneTo, distance);
+                        if (to <= from) continue;
+
+                        float resolution = MathF.Max((zoneTo - zoneFrom) / 8f, 0.01f);
+                        int steps = Math.Clamp((int)MathF.Ceiling((to - from) / resolution), 1, MaxTaperSamples);
+                        // The first sample sits on the zone boundary, so full width holds right up to it.
+                        for (int k = 0; k <= steps; k++)
+                        {
+                            float d = from + (to - from) * (k / (float)steps);
+                            if (d >= distance) break;
+                            float u = (d - previousDistance) / segmentSpan;
+                            if (u <= 0f) continue;
+                            Vector2 q = Vector2.Lerp(prev, p, u);
+                            float pressureAt = fromPressure + (toPressure - fromPressure) * u;
+                            float r = halfWidth * curve.Apply(pressureAt) * Taper(d, totalLength, options.TaperStart, options.TaperEnd);
+                            r = MathF.Max(r, 0.05f);
+                            left.Add(q + normal * r);
+                            right.Add(q - normal * r);
+                        }
+                    }
+                }
             }
 
             float radius = halfWidth * curve.Apply(points.Pressure[i]);

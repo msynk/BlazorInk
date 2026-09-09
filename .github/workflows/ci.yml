@@ -31,13 +31,22 @@ jobs:
       - name: Build
         run: dotnet build BlazorInk.sln -c Release --no-restore
 
-      - name: Unit and component tests
+      # dotnet test takes one project at a time, so the two suites are separate commands.
+      - name: Unit tests
         run: >
-          dotnet test tests/BlazorInk.Core.Tests tests/BlazorInk.Tests
+          dotnet test tests/BlazorInk.Core.Tests
           -c Release --no-build
           --collect:"XPlat Code Coverage"
           --results-directory ./artifacts/test-results
-          --logger "trx;LogFileName=tests.trx"
+          --logger "trx;LogFileName=core-tests.trx"
+
+      - name: Component tests
+        run: >
+          dotnet test tests/BlazorInk.Tests
+          -c Release --no-build
+          --collect:"XPlat Code Coverage"
+          --results-directory ./artifacts/test-results
+          --logger "trx;LogFileName=component-tests.trx"
 
       - name: Upload test results
         if: always()

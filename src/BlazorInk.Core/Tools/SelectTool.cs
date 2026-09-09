@@ -73,6 +73,13 @@ public sealed class SelectTool : ToolBase
     /// <summary>Extra hit distance in view pixels when clicking thin elements.</summary>
     public float HitTolerance { get; set; } = 5f;
 
+    /// <summary>
+    /// How much the handle and element hit areas grow for a finger. A fingertip covers far more than a mouse
+    /// cursor and cannot be aimed as precisely, so the drawn handles stay small while what they respond to gets
+    /// close to the 24 by 24 pixel target that WCAG 2.5.8 asks for.
+    /// </summary>
+    public float TouchTargetScale { get; set; } = 2.8f;
+
     /// <summary>Whether resizing keeps the aspect ratio unless Shift is held (the default inverts this for corners).</summary>
     public bool PreserveAspectByDefault { get; set; }
 
@@ -94,12 +101,13 @@ public sealed class SelectTool : ToolBase
         _movedPastThreshold = false;
 
         Selection selection = context.Selection;
-        float tolerance = HitTolerance / viewport.Zoom;
+        float targetScale = sample.Kind == PointerKind.Touch ? TouchTargetScale : 1f;
+        float tolerance = HitTolerance * targetScale / viewport.Zoom;
 
         // A handle of the current selection takes priority over anything under the cursor.
         if (!selection.IsEmpty)
         {
-            SelectionHandle handle = HitHandle(context, doc);
+            SelectionHandle handle = HitHandle(context, doc, targetScale);
             if (handle != SelectionHandle.None)
             {
                 _handle = handle;
@@ -122,10 +130,23 @@ public sealed class SelectTool : ToolBase
             return true;
         }
 
+        bool wasSelected = selection.Contains(hit.Id);
         if (_addToSelection) selection.Toggle(hit.Id);
-        else if (!selection.Contains(hit.Id)) selection.Set(hit.Id);
+        else if (!wasSelected) selection.Set(hit.Id);
 
-        if (selection.IsEmpty) return true;
+        if (selection.IsEmpty)
+        {
+            context.Announce("Selection cleared.");
+            return true;
+        }
+        // Picking something up has to be announced too, not only marquee and keyboard selection, or a screen
+        // reader user who taps an element is told nothing about what they now have.
+        if (!wasSelected || _addToSelection)
+        {
+            context.Announce(selection.Count == 1
+                ? "Selected: " + hit.GetAccessibleDescription()
+                : $"{selection.Count} elements selected.");
+        }
         _drag = DragKind.Move;
         _startBounds = selection.Bounds;
         CaptureTransforms(context);
@@ -196,7 +217,8 @@ public sealed class SelectTool : ToolBase
     public override void OnPointerCancel(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (_drag == DragKind.None) return;
+        // Only the contact that started the drag can end it; see DrawTool.OnPointerCancel.
+        if (_drag == DragKind.None || sample.PointerId != _pointerId) return;
         context.ReleasePointer(sample.PointerId);
         Cancel(context);
     }
@@ -331,13 +353,19 @@ public sealed class SelectTool : ToolBase
     }
 
     /// <summary>Returns the handle at a document point, or <see cref="SelectionHandle.None"/>.</summary>
-    public SelectionHandle HitHandle(IToolContext context, Vector2 documentPoint)
+    public SelectionHandle HitHandle(IToolContext context, Vector2 documentPoint) => HitHandle(context, documentPoint, 1f);
+
+    /// <summary>Returns the handle at a document point, with hit areas grown by a factor.</summary>
+    /// <param name="context">The tool context.</param>
+    /// <param name="documentPoint">The point to test, in document coordinates.</param>
+    /// <param name="targetScale">Multiplier for the hit radius; greater than one for touch.</param>
+    public SelectionHandle HitHandle(IToolContext context, Vector2 documentPoint, float targetScale)
     {
         ArgumentNullException.ThrowIfNull(context);
         Rect bounds = context.Selection.Bounds;
         if (bounds.IsEmpty) return SelectionHandle.None;
         float zoom = context.Viewport.Zoom;
-        float radius = (HandleSize / 2f + 3f) / zoom;
+        float radius = (HandleSize / 2f + 3f) * MathF.Max(targetScale, 1f) / zoom;
         Span<(SelectionHandle Handle, Vector2 Position)> handles = stackalloc (SelectionHandle, Vector2)[9];
         int count = GetHandlePositions(bounds, RotateHandleDistance / zoom, handles);
         for (int i = 0; i < count; i++)
@@ -429,10 +457,20 @@ public sealed class SelectTool : ToolBase
             {
                 if (selection.IsEmpty) return false;
                 int n = selection.Count;
-                context.Document.RemoveElements(selection.Ids);
+                using (context.History.BeginGroup("Delete"))
+                {
+                    context.Document.RemoveElements(selection.Ids);
+                }
                 context.Announce($"Deleted {n} elements.");
                 return true;
             }
+            case "Enter":
+                // Entering the canvas's own navigation mode. Until something is selected, Tab still moves browser
+                // focus out of the canvas, so this is a way in rather than a keyboard trap.
+                return SelectByOffset(context, 0);
+            case "Tab":
+                if (selection.IsEmpty) return false;
+                return SelectByOffset(context, key.Shift ? -1 : 1);
             case "ArrowLeft":
             case "ArrowRight":
             case "ArrowUp":
@@ -440,6 +478,7 @@ public sealed class SelectTool : ToolBase
             {
                 if (selection.IsEmpty) return false;
                 float step = key.Shift ? 10f : 1f;
+                if (key.Ctrl) return ResizeSelection(context, key.Key, step);
                 Vector2 delta = key.Key switch
                 {
                     "ArrowLeft" => new Vector2(-step, 0),
@@ -448,19 +487,14 @@ public sealed class SelectTool : ToolBase
                     _ => new Vector2(0, step),
                 };
                 var moved = selection.Elements.Select(e => e.Translate(delta)).ToList();
-                try
-                {
-                    context.Document.ReplaceElements(moved, "Move");
-                }
-                catch (InvalidOperationException ex)
-                {
-                    context.Announce("That move was refused: " + ex.Message);
-                    return true;
-                }
-                context.InvalidateDocument();
-                context.InvalidateOverlay();
+                if (!TryReplace(context, moved, "Move")) return true;
+                context.Announce($"Moved {moved.Count} elements.");
                 return true;
             }
+            case "r":
+            case "R":
+                if (selection.IsEmpty) return false;
+                return RotateSelection(context, key.Shift ? -KeyboardRotationStep : KeyboardRotationStep);
             case "a" when key.Ctrl:
                 selection.SelectAll();
                 context.Announce($"{selection.Count} elements selected.");
@@ -468,5 +502,102 @@ public sealed class SelectTool : ToolBase
             default:
                 return false;
         }
+    }
+
+    /// <summary>Rotation applied by one press of the rotate key, in radians.</summary>
+    private const float KeyboardRotationStep = MathF.PI / 12f;
+
+    /// <summary>
+    /// Moves the selection to another element in document order. Offset 0 selects the first element, which is how
+    /// a keyboard user gets into the canvas without a pointer.
+    /// </summary>
+    private static bool SelectByOffset(IToolContext context, int offset)
+    {
+        List<InkElement> candidates = Selectable(context.Document);
+        if (candidates.Count == 0)
+        {
+            context.Announce("Nothing here to select.");
+            return true;
+        }
+
+        int index = 0;
+        if (offset != 0 && context.Selection.Count > 0)
+        {
+            Guid current = context.Selection.Ids[^1];
+            int found = candidates.FindIndex(e => e.Id == current);
+            // Modulo of a negative index is negative in C#, so the count is added back before wrapping.
+            index = found < 0 ? 0 : ((found + offset) % candidates.Count + candidates.Count) % candidates.Count;
+        }
+
+        InkElement target = candidates[index];
+        context.Selection.Set(target.Id);
+        context.Announce($"{index + 1} of {candidates.Count}: {target.GetAccessibleDescription()}");
+        context.InvalidateOverlay();
+        return true;
+    }
+
+    private static List<InkElement> Selectable(InkDocument document)
+    {
+        var result = new List<InkElement>();
+        foreach (Layer layer in document.Layers)
+        {
+            if (!layer.IsVisible || layer.IsLocked) continue;
+            foreach (InkElement element in layer.Elements)
+            {
+                if (element.IsSelectable) result.Add(element);
+            }
+        }
+        return result;
+    }
+
+    private static bool ResizeSelection(IToolContext context, string key, float step)
+    {
+        Rect bounds = context.Selection.Bounds;
+        if (bounds.IsUnset || bounds.Width <= 0 || bounds.Height <= 0) return true;
+
+        // The anchor is the top-left corner, so the selection grows and shrinks the way dragging the opposite
+        // handle would, and repeated presses do not drift.
+        float sx = key is "ArrowLeft" or "ArrowRight" ? (bounds.Width + (key == "ArrowRight" ? step : -step)) / bounds.Width : 1f;
+        float sy = key is "ArrowUp" or "ArrowDown" ? (bounds.Height + (key == "ArrowDown" ? step : -step)) / bounds.Height : 1f;
+        if (sx < 0.01f || sy < 0.01f) return true;
+
+        Vector2 anchor = bounds.TopLeft;
+        Matrix3x2 matrix = Matrix3x2.CreateTranslation(-anchor) * Matrix3x2.CreateScale(sx, sy) * Matrix3x2.CreateTranslation(anchor);
+        var scaled = context.Selection.Elements.Select(e => e.TransformBy(matrix)).ToList();
+        if (!TryReplace(context, scaled, "Resize")) return true;
+        Rect after = context.Selection.Bounds;
+        context.Announce(FormattableString.Invariant($"Resized to {after.Width:0} by {after.Height:0}."));
+        return true;
+    }
+
+    private static bool RotateSelection(IToolContext context, float radians)
+    {
+        Rect bounds = context.Selection.Bounds;
+        if (bounds.IsUnset) return true;
+        Matrix3x2 matrix = Matrix3x2.CreateRotation(radians, bounds.Center);
+        var rotated = context.Selection.Elements.Select(e => e.TransformBy(matrix)).ToList();
+        if (!TryReplace(context, rotated, "Rotate")) return true;
+        context.Announce(FormattableString.Invariant($"Rotated {radians * 180f / MathF.PI:0} degrees."));
+        return true;
+    }
+
+    private static bool TryReplace(IToolContext context, List<InkElement> elements, string label)
+    {
+        if (elements.Count == 0) return false;
+        // A keyboard edit is grouped exactly like a drag. Anything an application applies in response, such as
+        // re-routing a connector attached to the element that moved, then lands in the same undo step.
+        using IDisposable group = context.History.BeginGroup(label);
+        try
+        {
+            context.Document.ReplaceElements(elements, label);
+        }
+        catch (InvalidOperationException ex)
+        {
+            context.Announce($"That {label.ToLowerInvariant()} was refused: " + ex.Message);
+            return false;
+        }
+        context.InvalidateDocument();
+        context.InvalidateOverlay();
+        return true;
     }
 }

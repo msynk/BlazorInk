@@ -17,7 +17,8 @@ With gestures on the canvas sets `touch-action: none` and owns every touch. Use 
 
 ## Palm rejection
 
-While a pen is in contact, touch contacts are ignored:
+While a pen is in contact, touch contacts are ignored. A hand usually lands before the nib does, so a touch
+gesture that is already in progress when the pen arrives is cancelled rather than left to commit a mark:
 
 ```razor
 <InkCanvas RejectTouchWhilePen="true" />   <!-- default -->
@@ -29,7 +30,9 @@ finger-first surface where someone might legitimately use both at once.
 
 ## Pinch zoom and panning
 
-With `EnableTouchGestures="true"`, `PanTool` handles two-finger pan and pinch:
+With `EnableTouchGestures="true"` a second finger takes over the gesture whatever the active tool is: the
+in-flight tool gesture is cancelled and both contacts drive pan and pinch zoom until the last finger lifts. One
+finger still draws. `PanTool` does the same thing when it is the active tool:
 
 ```csharp
 var pan = new PanTool { MinZoom = 0.1f, MaxZoom = 32f, EnablePinchZoom = true };
@@ -80,3 +83,9 @@ browsers that support it. `Capabilities.LowLatencyCanvas` reports whether the br
 - A form annotation over a document: gestures off so the page still scrolls, and a highlight tool rather than
   freehand for text.
 - Test with a real stylus. Mouse input exercises none of the pressure, tilt or palm-rejection paths.
+
+## Hit targets
+
+Selection handles are drawn small, but what they respond to is not. A contact reported as touch grows the handle
+and element hit areas by `SelectTool.TouchTargetScale`, which is 2.8 by default, so a fingertip lands on a target
+close to the 24 by 24 pixel minimum WCAG 2.5.8 asks for without the handles looking clumsy under a mouse.

@@ -11,6 +11,9 @@ public static class StrokeEditor
 {
     /// <summary>
     /// Splits a stroke's points into the runs that survive erasing with a circular eraser swept along a path.
+    /// Each stored point is classified on its own, so the caller is responsible for supplying points dense enough
+    /// that the eraser cannot pass between two of them. <see cref="EraseSegments"/> does that and is what tools
+    /// should use; this is the lower level primitive.
     /// </summary>
     /// <param name="points">The stroke's points in local coordinates.</param>
     /// <param name="eraserPath">The eraser positions in the same coordinates (at least one).</param>
@@ -111,15 +114,25 @@ public static class StrokeEditor
         }
 
         float effectiveRadius = radius + stroke.Brush.HitTestWidth / 2f;
+
+        // The cut is made against the stroke's shape, not against the points that happen to be stored. Committed
+        // strokes are simplified, so a straight section is often just two points hundreds of units apart: testing
+        // only those would let the eraser pass straight through the gap, and touching one end would leave a single
+        // surviving point that is dropped as a dot, deleting the whole stroke. Subdividing the segments the eraser
+        // can reach makes the cut land where the ink actually is.
+        StrokePoints subject = Subdivide(stroke.Points, path, effectiveRadius);
+
         var runs = new List<(int Start, int Length)>();
-        bool erased = SplitByEraser(stroke.Points, path, effectiveRadius, runs);
+        bool erased = SplitByEraser(subject, path, effectiveRadius, runs);
         GC.KeepAlive(rented);
         if (!erased) return false;
 
         for (int i = 0; i < runs.Count; i++)
         {
             (int start, int length) = runs[i];
-            StrokePoints slice = stroke.Points.Slice(start, length);
+            // The inserted points lie exactly on the original segments, so simplification removes the ones the cut
+            // did not need and the fragment is no larger than the piece of stroke it represents.
+            StrokePoints slice = subject.Slice(start, length).Simplify(0.02f, 0.01f);
             Stroke fragment = i == 0
                 ? stroke with { Points = slice }
                 : stroke with { Points = slice, Id = Guid.NewGuid(), Version = 0 };
@@ -127,6 +140,64 @@ public static class StrokeEditor
         }
         return true;
     }
+
+    /// <summary>Largest number of points one segment is split into, so a very long segment cannot explode the cost.</summary>
+    private const int MaxSubdivisionsPerSegment = 128;
+
+    /// <summary>
+    /// Returns the points with extra samples inserted along the segments the eraser can reach, spaced closely
+    /// enough that a crossing cannot fall between two of them. Segments the eraser is nowhere near are left alone,
+    /// so an eraser stroke over a dense drawing costs nothing extra.
+    /// </summary>
+    private static StrokePoints Subdivide(StrokePoints points, ReadOnlySpan<Vector2> eraserPath, float radius)
+    {
+        int n = points.Count;
+        if (n < 2 || radius <= 0) return points;
+
+        Rect reach = GeometryMath.Bounds(eraserPath).Inflate(radius);
+        float step = MathF.Max(radius * 0.5f, 0.05f);
+
+        // Nothing to do when every segment is already shorter than the step, which is the common case.
+        bool needed = false;
+        for (int i = 1; i < n && !needed; i++)
+        {
+            Vector2 a = points.PositionAt(i - 1), b = points.PositionAt(i);
+            if (Vector2.Distance(a, b) > step && Rect.FromPoints(a, b).Intersects(reach)) needed = true;
+        }
+        if (!needed) return points;
+
+        var buffer = new StrokePointBuffer(Math.Min(n * 4, 4096));
+        for (int i = 0; i < n; i++)
+        {
+            InkPoint current = points[i];
+            buffer.Add(current);
+            if (i == n - 1) break;
+
+            InkPoint next = points[i + 1];
+            Vector2 a = current.Position, b = next.Position;
+            float length = Vector2.Distance(a, b);
+            if (length <= step || !Rect.FromPoints(a, b).Intersects(reach)) continue;
+
+            int parts = Math.Min((int)MathF.Ceiling(length / step), MaxSubdivisionsPerSegment);
+            for (int k = 1; k < parts; k++)
+            {
+                float t = k / (float)parts;
+                buffer.Add(Lerp(current, next, t));
+            }
+        }
+        return buffer.ToStrokePoints();
+    }
+
+    private static InkPoint Lerp(in InkPoint a, in InkPoint b, float t) => new()
+    {
+        X = a.X + (b.X - a.X) * t,
+        Y = a.Y + (b.Y - a.Y) * t,
+        Pressure = a.Pressure + (b.Pressure - a.Pressure) * t,
+        Time = a.Time + (b.Time - a.Time) * t,
+        TiltX = a.TiltX + (b.TiltX - a.TiltX) * t,
+        TiltY = a.TiltY + (b.TiltY - a.TiltY) * t,
+        Twist = a.Twist + (b.Twist - a.Twist) * t,
+    };
 
     /// <summary>Returns the stroke with the first <paramref name="count"/> points removed, or null when nothing remains.</summary>
     public static Stroke? TrimStart(Stroke stroke, int count)

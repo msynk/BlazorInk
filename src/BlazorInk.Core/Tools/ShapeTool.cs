@@ -115,7 +115,8 @@ public sealed class ShapeTool : ToolBase
     public override void OnPointerCancel(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (!_dragging) return;
+        // Only the contact that started the drag can end it; see DrawTool.OnPointerCancel.
+        if (!_dragging || sample.PointerId != _pointerId) return;
         context.ReleasePointer(sample.PointerId);
         _dragging = false;
         _pointerId = -1;

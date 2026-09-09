@@ -56,10 +56,23 @@ public sealed class TextTool : ToolBase
             BeginEdit(context, existing);
             return true;
         }
+        return CreateAt(context, doc);
+    }
 
+    /// <summary>
+    /// Creates an empty text element and opens the editor over it. Exposed so a host can start text entry from
+    /// something other than a pointer, which is what makes text reachable from the keyboard.
+    /// </summary>
+    /// <param name="context">The tool context.</param>
+    /// <param name="documentPoint">Where the text box starts, in document coordinates.</param>
+    /// <returns>True when an element was created and the editor was requested.</returns>
+    public bool CreateAt(IToolContext context, Vector2 documentPoint)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (Editing is not null) return false;
         if (context.Document.TryGetLayer(context.ActiveLayerId, out Layer? layer) && (layer.IsLocked || !layer.IsVisible)) return false;
 
-        var element = new TextElement(doc, string.Empty)
+        var element = new TextElement(documentPoint, string.Empty)
         {
             Style = Style with { Color = context.ShapeStyle.StrokeColor },
             Size = new Vector2(DefaultWidth, Style.FontSize * Style.LineHeight),
@@ -187,9 +200,19 @@ public sealed class TextTool : ToolBase
     /// <inheritdoc />
     public override bool OnKeyDown(IToolContext context, ToolKeyEvent key)
     {
+        ArgumentNullException.ThrowIfNull(context);
         if (key.Key == "Escape" && Editing is not null)
         {
             CancelEdit(context);
+            return true;
+        }
+        // Without this the one interaction that is properly accessible, a real text field, could only be reached
+        // with a pointer. Enter opens it in the middle of the view.
+        if (key.Key == "Enter" && Editing is null)
+        {
+            Vector2 centre = context.Viewport.ToDocument(context.ViewSize / 2f);
+            if (!CreateAt(context, centre)) return false;
+            context.Announce("Text box added. Type, then press Enter to keep it or Escape to discard it.");
             return true;
         }
         return false;

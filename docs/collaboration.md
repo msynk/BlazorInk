@@ -110,6 +110,34 @@ receiver applies it as a single batched change with origin `Remote`, so it does 
 Both sides must be editing the same document, including its layer ids. In practice a client joins by loading the
 snapshot, which gives it exactly that.
 
+## Threading
+
+An `InkDocument` is not thread-safe: it is meant to be used from one thread, which in Blazor is the renderer's
+dispatcher. A real transport does not respect that on its own. SignalR raises `MessageReceived` on a thread-pool
+thread, so a message applied directly from that callback can run at the same moment the local user is drawing,
+and the two writers will corrupt the document's element index.
+
+Marshal the message inside your transport, before it raises `MessageReceived`. In a component,
+`ComponentBase.InvokeAsync` puts the work on the renderer's dispatcher:
+
+```csharp
+// The transport is constructed with the component's InvokeAsync so it can hand messages to the right thread.
+public sealed class SignalRTransport(HubConnection connection, Func<Func<Task>, Task> dispatch) : ICollaborationTransport
+{
+    public event Func<CollaborationMessage, Task>? MessageReceived;
+
+    public void Start() =>
+        connection.On<CollaborationMessage>("Message", message =>
+            dispatch(() => MessageReceived?.Invoke(message) ?? Task.CompletedTask));
+
+    // ...
+}
+```
+
+The same applies in the other direction. `UpdatePresenceAsync`, `FlushPresenceAsync` and `FlushAsync` read the
+document and the session's queue, so call them from the same thread that owns the document. The demo's
+`LoopbackTransport` is already on the dispatcher, which is why it needs nothing extra.
+
 ## Limits worth knowing
 
 - Two people editing the same element at the same moment: one edit wins, the other is dropped. Every replica

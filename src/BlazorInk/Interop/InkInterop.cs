@@ -222,11 +222,33 @@ internal sealed class InkInterop : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Tells the browser layer whether anything is selected. It decides from this whether Delete, Backspace and
+    /// the arrow keys belong to the canvas or to the page, and that decision has to be made synchronously inside
+    /// the key event.
+    /// </summary>
+    public ValueTask SetSelectionActiveAsync(bool active) => InvokeVoidAsync("setSelectionActive", _id, active);
+
     /// <summary>Measures text with the browser's font metrics.</summary>
     public async Task<TextMetrics?> MeasureTextAsync(string text, string font, CancellationToken cancellationToken = default)
     {
         if (_module is null || _disposed) return null;
-        return await _module.InvokeAsync<TextMetrics>("measureText", cancellationToken, _id, text, font).ConfigureAwait(false);
+        try
+        {
+            return await _module.InvokeAsync<TextMetrics>("measureText", cancellationToken, _id, text, font).ConfigureAwait(false);
+        }
+        catch (JSException)
+        {
+            return null;
+        }
+        catch (JSDisconnectedException)
+        {
+            return null;
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
     }
 
     /// <summary>Renders a command buffer into an offscreen canvas and returns encoded image bytes.</summary>
@@ -247,20 +269,6 @@ internal sealed class InkInterop : IAsyncDisposable
     {
         if (_module is null || _disposed) return null;
         return await _module.InvokeAsync<AttachResult?>("getSize", cancellationToken, _id).ConfigureAwait(false);
-    }
-
-    /// <summary>True when the user asked for reduced motion.</summary>
-    public async Task<bool> PrefersReducedMotionAsync()
-    {
-        if (_module is null || _disposed) return false;
-        try
-        {
-            return await _module.InvokeAsync<bool>("prefersReducedMotion").ConfigureAwait(false);
-        }
-        catch (JSException)
-        {
-            return false;
-        }
     }
 
     private ValueTask InvokeVoidAsync(string identifier, params object?[] args)
@@ -291,10 +299,23 @@ internal sealed class InkInterop : IAsyncDisposable
             catch (TaskCanceledException)
             {
             }
+#pragma warning disable CA1031 // Any other browser-side failure must still release the callback reference below.
+            catch
+            {
+            }
+#pragma warning restore CA1031
+            finally
+            {
+                // The callback reference is held by the JS interop tracking table until it is disposed. Losing it
+                // to an exception on the way out would pin this component for the lifetime of the circuit.
+                _callbacks?.Dispose();
+                _callbacks = null;
+                _module = null;
+            }
+            return;
         }
         _callbacks?.Dispose();
         _callbacks = null;
-        _module = null;
     }
 
     /// <summary>The object JavaScript calls back into. Kept separate so the public surface stays small.</summary>

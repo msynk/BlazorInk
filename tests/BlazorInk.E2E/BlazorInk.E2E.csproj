@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+  </PropertyGroup>
+  <!-- The fixture starts the already built demo rather than building it again, so the demo has to be built
+       before these tests run or they silently exercise a stale copy of the library. Referencing it without
+       taking its output makes the build order explicit without pulling its assets into the test output.
+       The demo is also in the solution, which is what makes a Release solution build produce the Release demo
+       this fixture launches. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\samples\BlazorInk.Demo\BlazorInk.Demo.csproj"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.Playwright" />
+    <PackageReference Include="Xunit.SkippableFact" />
+  </ItemGroup>
+</Project>

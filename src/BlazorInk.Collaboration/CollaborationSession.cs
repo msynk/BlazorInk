@@ -55,6 +55,8 @@ public sealed class CollaborationSession : IAsyncDisposable
     private readonly ConcurrentDictionary<string, long> _lastSequence = new(StringComparer.Ordinal);
     private readonly Queue<CollaborationMessage> _pending = new();
     private readonly object _queueGate = new();
+    private readonly SemaphoreSlim _flushGate = new(1, 1);
+    private DateTimeOffset _lastExpiryCheck = DateTimeOffset.MinValue;
     private long _sequence;
     private DateTimeOffset _lastPresenceSent = DateTimeOffset.MinValue;
     private PresenceState? _pendingPresence;
@@ -191,6 +193,32 @@ public sealed class CollaborationSession : IAsyncDisposable
     /// <summary>Sends everything queued while the transport was disconnected.</summary>
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
+        // Two overlapping flushes would peek the same message, send it twice and then dequeue twice, silently
+        // dropping the message behind it. Only one flush runs at a time.
+        try
+        {
+            await _flushGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+        try
+        {
+            await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            _flushGate.Release();
+        }
+    }
+
+    private async Task FlushCoreAsync(CancellationToken cancellationToken)
+    {
         while (_transport.IsConnected && !_disposed)
         {
             CollaborationMessage? message;
@@ -250,17 +278,29 @@ public sealed class CollaborationSession : IAsyncDisposable
     private async Task SendAsync(CollaborationMessage message, CancellationToken cancellationToken)
     {
         if (_disposed) return;
-        if (!_transport.IsConnected)
+
+        // A queue that is not yet drained must not be overtaken. The transport contract is that one sender's
+        // messages arrive in order, and a receiver discards anything that arrives behind a later sequence.
+        bool queued = false;
+        if (message.Kind == CollaborationMessageKind.Operation)
         {
-            // Presence is worthless once stale, so only durable changes are queued.
-            if (message.Kind != CollaborationMessageKind.Operation) return;
             lock (_queueGate)
             {
-                _pending.Enqueue(message);
-                while (_pending.Count > _options.MaxOfflineQueue) _pending.Dequeue();
+                if (!_transport.IsConnected || _pending.Count > 0)
+                {
+                    _pending.Enqueue(message);
+                    while (_pending.Count > _options.MaxOfflineQueue) _pending.Dequeue();
+                    queued = true;
+                }
             }
+        }
+        if (queued)
+        {
+            if (_transport.IsConnected) await FlushAsync(cancellationToken).ConfigureAwait(false);
             return;
         }
+        // Presence is worthless once stale, so it is dropped rather than queued.
+        if (!_transport.IsConnected) return;
 
         try
         {
@@ -289,6 +329,15 @@ public sealed class CollaborationSession : IAsyncDisposable
         if (_disposed || message is null) return;
         if (string.Equals(message.SenderId, ParticipantId, StringComparison.Ordinal)) return;
 
+        // A host that renders presence from the event rather than polling Participants would otherwise never
+        // expire anyone, so expiry is also driven by traffic. The check is throttled to stay off the hot path.
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (now - _lastExpiryCheck >= _options.PresenceInterval)
+        {
+            _lastExpiryCheck = now;
+            ExpireParticipants();
+        }
+
         // Duplicate delivery is harmless to ignore, and a lower sequence means a retransmission we already saw.
         if (message.Kind == CollaborationMessageKind.Operation || message.Kind == CollaborationMessageKind.Presence)
         {
@@ -316,7 +365,7 @@ public sealed class CollaborationSession : IAsyncDisposable
                 if (_options.ServeSnapshots) await SendSnapshotAsync().ConfigureAwait(false);
                 break;
             case CollaborationMessageKind.Leave:
-                if (_participants.TryRemove(message.SenderId, out _)) ParticipantLeft?.Invoke(message.SenderId);
+                Forget(message.SenderId);
                 break;
         }
     }
@@ -459,8 +508,19 @@ public sealed class CollaborationSession : IAsyncDisposable
         DateTimeOffset cutoff = DateTimeOffset.UtcNow - _options.PresenceTimeout;
         foreach ((string id, PresenceState state) in _participants)
         {
-            if (state.Timestamp < cutoff && _participants.TryRemove(id, out _)) ParticipantLeft?.Invoke(id);
+            if (state.Timestamp < cutoff) Forget(id);
         }
+    }
+
+    /// <summary>
+    /// Drops everything remembered about a participant. The de-duplication cursor has to go with the presence
+    /// entry: keeping it would grow without bound in a long-lived session, and a participant that rejoins with
+    /// the same id would have its first messages discarded as retransmissions.
+    /// </summary>
+    private void Forget(string participantId)
+    {
+        _lastSequence.TryRemove(participantId, out _);
+        if (_participants.TryRemove(participantId, out _)) ParticipantLeft?.Invoke(participantId);
     }
 
     /// <inheritdoc />
@@ -491,5 +551,7 @@ public sealed class CollaborationSession : IAsyncDisposable
 #pragma warning restore CA1031
         }
         _participants.Clear();
+        _lastSequence.Clear();
+        _flushGate.Dispose();
     }
 }

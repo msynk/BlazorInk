@@ -46,7 +46,7 @@ document.ReplaceElement(stroke with { Description = "Signature of Jane Doe" });
 document.AddElement(new LineShape(a, b) { EndArrow = true, Description = "Arrow pointing at the total" });
 ```
 
-Elements without a description fall back to something structural, such as "Stroke, 142 points, pen brush, colour
+Elements without a description fall back to something structural, such as "Stroke, 142 points, pen brush, color
 #111827", and text elements report their text. Exported SVG carries the same strings as `title` elements when
 `IncludeElementDescriptions` is set.
 
@@ -59,14 +59,29 @@ The canvas takes focus when it is drawn on, so shortcuts are reachable for someo
 | Ctrl+Z | Undo |
 | Ctrl+Shift+Z, Ctrl+Y | Redo |
 | Ctrl+A | Select all |
+| Enter | Select the first element, which is how you start navigating without a pointer |
+| Tab, Shift+Tab | Step to the next or previous element, announcing each one |
 | Delete, Backspace | Delete the selection |
 | Escape | Cancel the gesture, then clear the selection |
 | Arrow keys | Nudge the selection; Shift for larger steps |
+| Ctrl+arrow keys | Resize the selection; Shift for larger steps |
+| R, Shift+R | Rotate the selection by 15 degrees |
+| Enter, with the text tool active | Open a text box in the middle of the view |
 | Ctrl+0 | Reset zoom |
 | Ctrl+9 | Zoom to fit |
 | Ctrl+plus, Ctrl+minus | Zoom |
 
-Turn them off with `EnableKeyboardShortcuts="false"` if the surrounding application owns those keys.
+Every element can therefore be reached, moved, resized, rotated and deleted without a pointer, and each step
+announces what is now selected. Text is reachable too: the text tool opens its real HTML editor from the keyboard,
+so dictation, an input method and a screen reader all work on it.
+
+The canvas is not a keyboard trap. Tab belongs to it only while an element is selected: pressing Escape clears
+the selection, and the next Tab moves focus out of the canvas as usual. Delete, Backspace and the arrow keys are
+likewise left to the page when nothing is selected, so a keyboard user can still scroll past a focused canvas.
+Keys pressed inside `ChildContent`, or in any input, button or link within the canvas, are never intercepted.
+
+Turn them off with `EnableKeyboardShortcuts="false"` if the surrounding application owns those keys. That
+genuinely releases the keys: the browser layer stops preventing their default behaviour as well.
 
 Keyboard input travels the same path as pointer input, so it does not depend on a framework event and does not
 re-render the component per keystroke.

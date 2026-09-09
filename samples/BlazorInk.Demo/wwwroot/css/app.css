@@ -453,3 +453,23 @@ th {
   height: 100vh;
   color: var(--text-muted);
 }
+
+/* A keyboard user should not have to tab through eleven navigation links to reach the canvas. */
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  padding: 0.6rem 1rem;
+  background: #111827;
+  color: #ffffff;
+  border-radius: 0 0 6px 0;
+}
+
+.skip-link:focus {
+  left: 0;
+}
+
+main:focus {
+  outline: none;
+}

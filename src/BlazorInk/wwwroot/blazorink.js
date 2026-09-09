@@ -32,9 +32,17 @@ const PHASE_HOVER = 4;
 
 const POINTER_KIND = { mouse: 1, touch: 2, pen: 3 };
 
+// Decoded images are held so a redraw does not re-decode. The cache is bounded because a deleted or undone
+// image element is never referenced again and would otherwise be retained for the life of the page. Eviction is
+// least-recently-used and never touches an image the last rendered frame drew, so a document with more images
+// than the cache nominally holds still renders all of them.
+const MAX_CACHED_IMAGES = 128;
+
 // Keys the canvas acts on. The browser default is suppressed for these so the page does not also scroll,
 // select all its text, or navigate back.
 const OWNED_KEYS = new Set(['Escape', 'Delete', 'Backspace', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
+// Of those, the ones that only do something when the selection is not empty.
+const SELECTION_KEYS = new Set(['Delete', 'Backspace', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown']);
 const OWNED_SHORTCUTS = new Set(['z', 'y', 'a', '0', '9', '+', '=', '-']);
 
 // Command opcodes, matching CanvasCommand in C#.
@@ -98,11 +106,14 @@ class Surface {
     this.samples = new Float64Array(SAMPLE_SIZE * 256);
     this.sampleCount = 0;
     this.frameRequested = false;
-    this.activePointers = new Set();
+    this.frameHandle = 0;
+    this.activePointers = new Map();
+    this.ownsSelectionKeys = false;
     this.penActive = false;
     this.disposed = false;
     this.wetInk = new Map();
     this.images = new Map();
+    this.imagesUsedThisFrame = new Set();
     this.frameToken = 0;
     this.rectFrame = -1;
     this.cachedRect = null;
@@ -250,10 +261,13 @@ class Surface {
 
   handlePointerDown(event) {
     if (this.shouldIgnore(event)) return;
-    if (event.pointerType === 'pen') this.penActive = true;
+    if (event.pointerType === 'pen' && !this.penActive) {
+      this.penActive = true;
+      this.retractTouchContacts(event);
+    }
     // Capturing on the element keeps the gesture alive when the pointer leaves the canvas.
     try { this.hitTarget.setPointerCapture(event.pointerId); } catch { /* capture is best effort */ }
-    this.activePointers.add(event.pointerId);
+    this.activePointers.set(event.pointerId, event.pointerType);
     this.push(event, PHASE_DOWN, 0);
     if (this.options.preventDefaultOnDown !== false) {
       // Preventing the default stops text selection and scrolling, but it also stops the browser from moving
@@ -265,6 +279,33 @@ class Surface {
       }
     }
     this.requestFlush();
+  }
+
+  // A hand usually lands before the nib does. Once a pen arrives, every touch contact already in progress was
+  // the palm, so those gestures are cancelled rather than left to commit a blob when the hand lifts.
+  retractTouchContacts(event) {
+    if (this.options.rejectTouchWhilePen === false) return;
+    for (const [pointerId, kind] of this.activePointers) {
+      if (kind !== 'touch') continue;
+      this.activePointers.delete(pointerId);
+      this.push({
+        pointerId,
+        pointerType: 'touch',
+        clientX: event.clientX,
+        clientY: event.clientY,
+        pressure: 0,
+        tiltX: 0,
+        tiltY: 0,
+        twist: 0,
+        timeStamp: event.timeStamp,
+        buttons: 0,
+        isPrimary: false,
+        shiftKey: false,
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+      }, PHASE_CANCEL, 0);
+    }
   }
 
   handlePointerMove(event) {
@@ -326,10 +367,37 @@ class Surface {
       return;
     }
 
-    if (OWNED_KEYS.has(event.key) || ((event.ctrlKey || event.metaKey) && OWNED_SHORTCUTS.has(event.key.toLowerCase()))) {
-      event.preventDefault();
-    }
+    // ChildContent renders inside the same element, so a caption field or a button in it would otherwise have
+    // Ctrl+A, Delete and the arrow keys taken away by the canvas.
+    if (event.target !== this.root && this.isInteractiveTarget(event.target)) return;
+
+    if (this.ownsKey(event)) event.preventDefault();
     this.callback.key(event.key, event.ctrlKey || event.metaKey, event.shiftKey, event.altKey);
+  }
+
+  isInteractiveTarget(target) {
+    if (!target || typeof target.closest !== 'function') return false;
+    if (target.isContentEditable) return true;
+    return target.closest('input, textarea, select, button, a[href], [contenteditable="true"], .blazorink-content') !== null;
+  }
+
+  // Delete, Backspace and the arrow keys do something only when there is a selection. Swallowing them when there
+  // is not would leave a keyboard user unable to scroll the page while the canvas has focus.
+  ownsKey(event) {
+    const key = event.key;
+    if ((event.ctrlKey || event.metaKey) && OWNED_SHORTCUTS.has(key.toLowerCase())) return true;
+    if (key === 'Escape') return true;
+    // Tab only belongs to the canvas while the user is stepping through elements. With nothing selected it moves
+    // browser focus out as usual, so the canvas is never a keyboard trap: Escape clears the selection and leaves.
+    if (key === 'Tab') return this.ownsSelectionKeys;
+    if (key === 'Enter') return true;
+    if (SELECTION_KEYS.has(key)) return this.ownsSelectionKeys;
+    return false;
+  }
+
+  // Told by .NET whether anything is selected, because only .NET knows.
+  setSelectionActive(active) {
+    this.ownsSelectionKeys = !!active;
   }
 
   textEditor() {
@@ -350,7 +418,7 @@ class Surface {
     this.frameToken++;
     if (this.frameRequested || this.disposed) return;
     this.frameRequested = true;
-    requestAnimationFrame(this.onFrame);
+    this.frameHandle = requestAnimationFrame(this.onFrame);
   }
 
   // Delivers one batch of samples per animation frame. Never one call per pointer event.
@@ -434,6 +502,10 @@ class Surface {
   execute(layer, buffer, count, strings) {
     const rootContext = this.contexts[layer];
     if (!rootContext) return;
+
+    // Images drawn by this replay are protected from eviction until the next one: dropping an image the current
+    // drawing still references would make it silently disappear from the canvas.
+    if (layer === 'document' || layer === 'export') this.imagesUsedThisFrame = new Set();
 
     const commands = normalizeBuffer(buffer, count);
     if (!commands) return;
@@ -560,7 +632,14 @@ class Surface {
           const sw = commands[i++];
           const sh = commands[i++];
           const alpha = commands[i++];
-          const image = this.images.get(strings[index]);
+          const uri = strings[index];
+          const image = this.images.get(uri);
+          if (image) {
+            // Touching the entry moves it to the back of the Map's insertion order, which is the LRU position.
+            this.images.delete(uri);
+            this.images.set(uri, image);
+            this.imagesUsedThisFrame.add(uri);
+          }
           if (image && image.complete && image.naturalWidth > 0) {
             ctx.globalAlpha = alpha;
             if (hasCrop) ctx.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
@@ -650,8 +729,21 @@ class Surface {
     });
     image.src = uri;
     await loaded;
+    this.images.delete(uri);
     this.images.set(uri, image);
+    this.evictImages();
     return { width: image.naturalWidth, height: image.naturalHeight };
+  }
+
+  // Drops the least recently used decoded bitmaps. Anything the last frame drew is kept whatever the cache size
+  // says: a document with more images than the limit would otherwise lose the ones drawn first on every redraw.
+  evictImages() {
+    if (this.images.size <= MAX_CACHED_IMAGES) return;
+    for (const uri of [...this.images.keys()]) {
+      if (this.images.size <= MAX_CACHED_IMAGES) break;
+      if (this.imagesUsedThisFrame.has(uri)) continue;
+      this.images.delete(uri);
+    }
   }
 
   measureText(text, font) {
@@ -681,9 +773,12 @@ class Surface {
     target.removeEventListener('contextmenu', this.onContextMenu);
     this.root.removeEventListener('keydown', this.onKeyDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
+    if (this.frameHandle) cancelAnimationFrame(this.frameHandle);
+    this.frameHandle = 0;
     this.resizeObserver?.disconnect();
     this.stopWatchingPixelRatio();
     this.images.clear();
+    this.imagesUsedThisFrame.clear();
     this.scratchCanvases.length = 0;
     this.callback = null;
   }
@@ -693,7 +788,16 @@ class Surface {
 
 export function attach(id, root, options) {
   detach(id);
-  const surface = new Surface(id, root, options);
+  reapDetachedSurfaces();
+  let surface;
+  try {
+    surface = new Surface(id, root, options);
+  } catch (error) {
+    // The constructor registers listeners and observers before it can fail. Without this they would outlive a
+    // surface that never made it into the map and could therefore never be detached.
+    try { surface?.dispose(); } catch { /* nothing more to do */ }
+    throw error;
+  }
   surfaces.set(id, surface);
   const rect = root.getBoundingClientRect();
   return {
@@ -754,6 +858,10 @@ export function setWetInkStyle(id, color, width, opacity) {
   surfaces.get(id)?.setWetInkStyle(color ? { color, width, opacity } : null);
 }
 
+export function setSelectionActive(id, active) {
+  surfaces.get(id)?.setSelectionActive(active);
+}
+
 export function setCursor(id, cursor) {
   const surface = surfaces.get(id);
   if (surface) surface.hitTarget.style.cursor = cursor;
@@ -766,6 +874,16 @@ export function loadImage(id, uri) {
 
 export function measureText(id, text, font) {
   return surfaces.get(id)?.measureText(text, font) ?? { width: 0, lines: 1 };
+}
+
+// A Blazor Server circuit that drops without running detach leaves its surface behind, holding two canvases and
+// an image cache. Reconnecting attaches a new one, so stale entries are swept whenever a surface is created.
+function reapDetachedSurfaces() {
+  for (const [key, surface] of surfaces) {
+    if (surface.root && surface.root.isConnected) continue;
+    surfaces.delete(key);
+    try { surface.dispose(); } catch { /* the page is going away anyway */ }
+  }
 }
 
 export function getSize(id) {
@@ -793,6 +911,10 @@ export async function renderToImage(id, pixelWidth, pixelHeight, commands, count
     surface.contexts.export = previous;
   }
 
+  // Isolated groups during export allocate scratch canvases the size of the export, not of the screen. Keeping
+  // them pooled would retain several very large canvases that on-screen rendering can never reuse.
+  surface.clearScratch();
+
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, mimeType || 'image/png', quality));
   if (!blob) throw new Error('The canvas could not be encoded.');
   const buffer = await blob.arrayBuffer();
@@ -819,12 +941,4 @@ export function readFile(input) {
     type: file.type,
     bytes: new Uint8Array(buffer),
   }));
-}
-
-export function prefersReducedMotion() {
-  return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
-}
-
-export function prefersHighContrast() {
-  return typeof matchMedia === 'function' && (matchMedia('(forced-colors: active)').matches || matchMedia('(prefers-contrast: more)').matches);
 }

@@ -26,7 +26,7 @@ never rewritten. That has three consequences worth knowing:
 
 - A drag of 10,000 selected strokes costs one matrix per stroke, not a rewrite of every point.
 - Undo restores the exact original transform, with no accumulated floating-point drift.
-- A stroke's width does not change when you scale it, unless you flatten it deliberately with `Stroke.Flatten()`.
+- Scaling a selection scales the ink with it, because the transform is applied when the element is drawn. The stored `Brush.Width` is left alone until you bake the transform in with `Stroke.Flatten()`, which folds the scale into the width and resets the transform.
 
 The whole gesture is a single undo step.
 

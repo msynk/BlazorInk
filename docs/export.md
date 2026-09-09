@@ -1,6 +1,6 @@
 # SVG and PNG export
 
-Both exporters walk the same `DocumentRenderer` path as the screen, so an exported file matches what was drawn.
+PNG export walks the same `DocumentRenderer` path as the screen, and SVG export walks the document itself, but both draw every element through the same `IRenderContext`, so an exported file matches what was drawn.
 
 ## SVG
 

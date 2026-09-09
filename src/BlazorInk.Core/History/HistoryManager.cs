@@ -26,6 +26,8 @@ public sealed class HistoryManager : IDisposable
     private bool _discardGroup;
     private bool _applying;
     private bool _disposed;
+    private int _limit;
+    private List<HistoryEntry>? _consequences;
 
     /// <summary>Creates a manager and starts recording the document's changes.</summary>
     public HistoryManager(InkDocument document, int limit = 200)
@@ -34,10 +36,25 @@ public sealed class HistoryManager : IDisposable
         _document = document;
         Limit = limit;
         document.Changed += OnDocumentChanged;
+        document.DispatchCompleted += OnDispatchCompleted;
     }
 
-    /// <summary>Maximum number of undo steps kept; older steps are dropped. Zero disables history.</summary>
-    public int Limit { get; set; }
+    /// <summary>
+    /// Maximum number of undo steps kept; older steps are dropped. Zero disables history. Lowering it trims the
+    /// stack immediately, so the elements those steps referenced are released rather than kept alive by a limit
+    /// that only applies to future changes.
+    /// </summary>
+    public int Limit
+    {
+        get => _limit;
+        set
+        {
+            _limit = value;
+            if (_undo.Count <= _limit) return;
+            _undo.RemoveRange(0, _undo.Count - Math.Max(_limit, 0));
+            Changed?.Invoke(this, EventArgs.Empty);
+        }
+    }
 
     /// <summary>True when there is something to undo.</summary>
     public bool CanUndo => _undo.Count > 0;
@@ -138,8 +155,12 @@ public sealed class HistoryManager : IDisposable
 
     private void EndGroup()
     {
+        // A scope can be disposed after the group it belongs to was already closed from outside, by
+        // EndOpenGroups or by Dispose when a gesture was interrupted. The tool that opened it still runs its
+        // finally block, and closing an already-closed group has to be a no-op rather than a crash.
+        if (_groupDepth == 0) return;
         if (--_groupDepth > 0) return;
-        List<HistoryEntry> entries = _group!;
+        List<HistoryEntry> entries = _group ?? [];
         _group = null;
         bool discard = _discardGroup;
         _discardGroup = false;
@@ -174,12 +195,37 @@ public sealed class HistoryManager : IDisposable
     {
         if (_applying || e.Origin != ChangeOrigin.Local || Limit <= 0) return;
         var entry = new HistoryEntry(e.Operation, e.Inverse, e.Operation.Label, DateTimeOffset.UtcNow);
+
+        // A change an application applied while handling another one is a consequence: re-routing a connector
+        // because the node it is attached to moved, say. It has to be recorded after its cause, and whether it
+        // arrives before or after depends only on the order the handlers were subscribed in, so it is held back
+        // until the whole notification has finished.
+        if (e.Depth > 0)
+        {
+            (_consequences ??= []).Add(entry);
+            return;
+        }
+        Record(entry);
+    }
+
+    private void Record(HistoryEntry entry)
+    {
         if (_groupDepth > 0)
         {
             _group!.Add(entry);
             return;
         }
         Push(entry);
+    }
+
+    private void OnDispatchCompleted()
+    {
+        if (_consequences is not { Count: > 0 }) return;
+        List<HistoryEntry> pending = _consequences;
+        _consequences = null;
+        // Several consequential edits made during one notification undo as one step with their cause when a
+        // group is open, and as one step of their own when there is none.
+        Record(pending.Count == 1 ? pending[0] : Merge(pending, pending[0].Label));
     }
 
     private void Push(HistoryEntry entry)
@@ -220,6 +266,10 @@ public sealed class HistoryManager : IDisposable
         if (_disposed) return;
         _disposed = true;
         _document.Changed -= OnDocumentChanged;
+        _document.DispatchCompleted -= OnDispatchCompleted;
         EndOpenGroups();
+        _consequences = null;
+        // The stacks are deliberately left intact: disposing stops recording, and a host that swaps documents
+        // still reads the final state. Call Clear to release the elements the stacks reference.
     }
 }

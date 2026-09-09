@@ -147,8 +147,10 @@ ipch/
 *.vspx
 *.sap
 
-# Visual Studio Trace Files
-*.e2e
+# Visual Studio Trace Files. The pattern is anchored to files, because Windows matches ignore rules without
+# regard to case and an unanchored "*.e2e" quietly excludes the whole tests/BlazorInk.E2E project.
+/**/*.e2e
+!tests/BlazorInk.E2E/
 
 # TFS 2012 Local Workspace
 $tf/

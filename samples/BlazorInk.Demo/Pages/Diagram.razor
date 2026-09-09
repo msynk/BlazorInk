@@ -1,0 +1,140 @@
+@page "/diagram"
+@using System.Numerics
+@using BlazorInk.Demo.Diagramming
+@implements IDisposable
+
+<PageTitle>Diagram surface</PageTitle>
+
+<h1>Diagram surface</h1>
+<p class="page-intro">
+    Nodes and connectors, built entirely on top of the document model. BlazorInk knows nothing about diagrams: a
+    node is a rectangle and a connector is a line, and what joins them is element metadata plus one listener.
+    Move a node and its connectors follow, in the same undo step as the move.
+</p>
+
+<div class="panel">
+    <div class="toolbar" role="toolbar" aria-label="Diagram tools">
+        <div class="toolbar-group" role="group" aria-label="Tool">
+            @foreach ((string id, string label) in Tools)
+            {
+                <button type="button" class="btn @(_toolId == id ? "active" : null)"
+                        aria-pressed="@(_toolId == id ? "true" : "false")"
+                        @onclick="() => SelectTool(id)">@label</button>
+            }
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <div class="toolbar-group" role="group" aria-label="Colour">
+            @foreach (string color in Palette)
+            {
+                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
+                        aria-label="@color" @onclick="() => SetColor(color)"></button>
+            }
+        </div>
+
+        <div class="toolbar-separator"></div>
+
+        <button type="button" class="btn" @onclick="AddSampleDiagram">Sample diagram</button>
+
+        <div class="toolbar-spacer"></div>
+
+        <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)"
+                @onclick="() => _canvas?.Undo()">Undo</button>
+        <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)"
+                @onclick="() => _canvas?.Redo()">Redo</button>
+        <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+    </div>
+
+    <div class="canvas-host">
+        <InkCanvas @ref="_canvas"
+                   Document="_document"
+                   Height="560px"
+                   Tool="_tool"
+                   ShapeStyle="_shapeStyle"
+                   EnableTouchGestures="true"
+                   AriaLabel="Diagram canvas"
+                   DocumentChanged="() => StateHasChanged()" />
+    </div>
+
+    <CanvasStatus Canvas="_canvas">
+        <span>@NodeCount nodes, @ConnectorCount connectors</span>
+        <span>@_graph?.RerouteCount connector reroutes</span>
+    </CanvasStatus>
+</div>
+
+<div class="note">
+    Drag with <strong>Node</strong> to draw a box, then drag with <strong>Connector</strong> from one box to
+    another. Switch to <strong>Select</strong> and move a node: the connectors re-route while the move is still
+    being reported, so the document never shows a connector detached from its node, and one undo puts everything
+    back. The connector's endpoints are derived data, so they are recomputed rather than stored as an offset.
+</div>
+
+@code {
+    private InkCanvas? _canvas;
+    private readonly InkDocument _document = new(new DocumentSettings { Width = 0, Height = 0, Background = InkColor.White });
+    private DiagramGraph? _graph;
+    private ITool _tool = new NodeTool();
+    private string _toolId = "node";
+    private string _color = "#2563eb";
+    private ShapeStyle _shapeStyle = new() { StrokeColor = InkColor.Parse("#2563eb"), StrokeWidth = 2f, FillColor = InkColor.Parse("#eff6ff") };
+
+    private static readonly (string Id, string Label)[] Tools =
+    [
+        ("node", "Node"),
+        ("connector", "Connector"),
+        ("select", "Select"),
+        ("pan", "Pan"),
+    ];
+
+    private static readonly string[] Palette = ["#2563eb", "#dc2626", "#15803d", "#a16207", "#7c3aed"];
+
+    private int NodeCount => _document.AllElements.Count(e => DiagramGraph.HasRole(e, DiagramGraph.NodeRole));
+
+    private int ConnectorCount => _document.AllElements.Count(e => DiagramGraph.HasRole(e, DiagramGraph.ConnectorRole));
+
+    protected override void OnInitialized()
+    {
+        _graph = new DiagramGraph(_document);
+        AddSampleDiagram();
+    }
+
+    private void SelectTool(string id)
+    {
+        _toolId = id;
+        _tool = id switch
+        {
+            "connector" => new ConnectorTool(),
+            "select" => new SelectTool(),
+            "pan" => new PanTool(),
+            _ => new NodeTool(),
+        };
+    }
+
+    private void SetColor(string color)
+    {
+        _color = color;
+        InkColor stroke = InkColor.Parse(color);
+        _shapeStyle = _shapeStyle with { StrokeColor = stroke, FillColor = stroke with { A = 24 } };
+    }
+
+    private void AddSampleDiagram()
+    {
+        // Built as one batch so the whole example is a single undo step.
+        using (_document.BeginBatch("Sample diagram"))
+        {
+            RectangleShape capture = DiagramGraph.CreateNode(new Rect(80, 80, 150, 60), _shapeStyle, "Capture");
+            RectangleShape process = DiagramGraph.CreateNode(new Rect(330, 200, 150, 60), _shapeStyle, "Process");
+            RectangleShape store = DiagramGraph.CreateNode(new Rect(80, 320, 150, 60), _shapeStyle, "Store");
+
+            _document.AddElement(capture);
+            _document.AddElement(process);
+            _document.AddElement(store);
+            _document.AddElement(DiagramGraph.CreateConnector(capture, process, _shapeStyle));
+            _document.AddElement(DiagramGraph.CreateConnector(process, store, _shapeStyle));
+        }
+        _canvas?.Refresh();
+    }
+
+    public void Dispose() => _graph?.Dispose();
+}

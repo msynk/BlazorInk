@@ -5,7 +5,7 @@ A native drawing and ink engine for Blazor.
 The stroke model, smoothing, pressure response, hit testing, undo, serialization and export are written in C#.
 JavaScript does only what the browser alone can do: collect pointer and keyboard input, and replay a command
 buffer onto a canvas. There is no JavaScript drawing library underneath. The one drawing JavaScript does is a
-provisional trail under Blazor Server, described in [hosting models](docs/hosting-models.md), which exists to
+provisional trail under Blazor Server, described in [hosting models](https://github.com/msynk/BlazorInk/blob/main/docs/hosting-models.md), which exists to
 hide network latency and is replaced by the engine's own geometry.
 
 ```razor
@@ -45,6 +45,10 @@ Add the namespace to `_Imports.razor`:
 
 ```razor
 @using BlazorInk
+@using BlazorInk.Brushes
+@using BlazorInk.Geometry
+@using BlazorInk.Rendering
+@using BlazorInk.Tools
 ```
 
 The stylesheet the component needs is injected automatically by the package's Blazor initializer. To add it
@@ -68,20 +72,20 @@ processes them, and only the affected canvas layer is redrawn.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md)
-- [Architecture](docs/architecture.md)
-- [Drawing, brushes and pressure](docs/drawing-and-brushes.md)
-- [Erasing](docs/erasing.md)
-- [Selection, transforms and layers](docs/selection-and-layers.md)
-- [Annotations, text and images](docs/annotations-and-images.md)
-- [Serialization](docs/serialization.md)
-- [SVG and PNG export](docs/export.md)
-- [Hosting models: WebAssembly, Server and Hybrid](docs/hosting-models.md)
-- [Performance](docs/performance.md)
-- [Accessibility](docs/accessibility.md)
-- [Mobile, touch and stylus](docs/mobile-and-stylus.md)
-- [Collaboration](docs/collaboration.md)
-- [Extending the framework](docs/extending.md)
+- [Getting started](https://github.com/msynk/BlazorInk/blob/main/docs/getting-started.md)
+- [Architecture](https://github.com/msynk/BlazorInk/blob/main/docs/architecture.md)
+- [Drawing, brushes and pressure](https://github.com/msynk/BlazorInk/blob/main/docs/drawing-and-brushes.md)
+- [Erasing](https://github.com/msynk/BlazorInk/blob/main/docs/erasing.md)
+- [Selection, transforms and layers](https://github.com/msynk/BlazorInk/blob/main/docs/selection-and-layers.md)
+- [Annotations, text and images](https://github.com/msynk/BlazorInk/blob/main/docs/annotations-and-images.md)
+- [Serialization](https://github.com/msynk/BlazorInk/blob/main/docs/serialization.md)
+- [SVG and PNG export](https://github.com/msynk/BlazorInk/blob/main/docs/export.md)
+- [Hosting models: WebAssembly, Server and Hybrid](https://github.com/msynk/BlazorInk/blob/main/docs/hosting-models.md)
+- [Performance](https://github.com/msynk/BlazorInk/blob/main/docs/performance.md)
+- [Accessibility](https://github.com/msynk/BlazorInk/blob/main/docs/accessibility.md)
+- [Mobile, touch and stylus](https://github.com/msynk/BlazorInk/blob/main/docs/mobile-and-stylus.md)
+- [Collaboration](https://github.com/msynk/BlazorInk/blob/main/docs/collaboration.md)
+- [Extending the framework](https://github.com/msynk/BlazorInk/blob/main/docs/extending.md)
 
 ## Demo
 
@@ -89,8 +93,9 @@ processes them, and only the affected canvas layer is redrawn.
 dotnet run --project samples/BlazorInk.Demo
 ```
 
-The demo covers a signature field, a handwriting surface, a full whiteboard, image annotation, document review,
-two-way collaboration, the serialization format and a performance page that measures the engine in your browser.
+The demo covers a signature field, a handwriting surface, a full whiteboard, a diagram surface with connectors
+that follow the nodes they join, image annotation, document review, two-way collaboration, the serialization
+format and a performance page that measures the engine in your browser.
 
 ## Requirements
 

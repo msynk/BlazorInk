@@ -7,12 +7,13 @@ namespace BlazorInk;
 /// <summary>Raised after a document changed.</summary>
 public sealed class DocumentChangedEventArgs : EventArgs
 {
-    internal DocumentChangedEventArgs(DrawingOperation operation, DrawingOperation inverse, ChangeOrigin origin, long revision)
+    internal DocumentChangedEventArgs(DrawingOperation operation, DrawingOperation inverse, ChangeOrigin origin, long revision, int depth)
     {
         Operation = operation;
         Inverse = inverse;
         Origin = origin;
         Revision = revision;
+        Depth = depth;
     }
 
     /// <summary>The operation that was applied.</summary>
@@ -26,6 +27,13 @@ public sealed class DocumentChangedEventArgs : EventArgs
 
     /// <summary>The document revision after the change.</summary>
     public long Revision { get; }
+
+    /// <summary>
+    /// How deeply this change is nested inside another change's notification. Zero for a change applied on its
+    /// own; one for a change a listener applied while handling that one, and so on. Use it to tell a consequence
+    /// from its cause, for example to avoid re-deriving geometry that a handler is already deriving.
+    /// </summary>
+    public int Depth { get; }
 }
 
 /// <summary>
@@ -54,6 +62,7 @@ public sealed class InkDocument
     private ChangeOrigin _batchOrigin;
     private string? _batchLabel;
     private long _totalPoints;
+    private int _dispatchDepth;
 
     /// <summary>Creates a document with default settings and one layer named "Drawing".</summary>
     public InkDocument() : this(DocumentSettings.Default) { }
@@ -199,9 +208,36 @@ public sealed class InkDocument
             return inverse;
         }
         Revision++;
-        Changed?.Invoke(this, new DocumentChangedEventArgs(operation, inverse, origin, Revision));
+        Raise(operation, inverse, origin);
         return inverse;
     }
+
+    /// <summary>
+    /// Reports a change. A listener may apply further changes while handling one, for example to keep derived
+    /// geometry in sync; those are reported immediately, nested inside this one, and carry a greater
+    /// <see cref="DocumentChangedEventArgs.Depth"/> so a listener can tell a consequence from its cause.
+    /// </summary>
+    private void Raise(DrawingOperation operation, DrawingOperation inverse, ChangeOrigin origin)
+    {
+        _dispatchDepth++;
+        try
+        {
+            Changed?.Invoke(this, new DocumentChangedEventArgs(operation, inverse, origin, Revision, _dispatchDepth - 1));
+        }
+        finally
+        {
+            _dispatchDepth--;
+            if (_dispatchDepth == 0) DispatchCompleted?.Invoke();
+        }
+    }
+
+    /// <summary>
+    /// Raised once the outermost <see cref="Changed"/> notification, and everything it caused, have been
+    /// reported. History uses it to place a consequential change after the change that caused it whatever order
+    /// the handlers ran in; without it an application that subscribed before the history manager would have the
+    /// consequence recorded first, and undoing that step would leave its derived geometry behind.
+    /// </summary>
+    internal event Action? DispatchCompleted;
 
     /// <summary>
     /// Groups all operations applied until the returned scope is disposed into a single <see cref="BatchOperation"/>
@@ -238,7 +274,7 @@ public sealed class InkDocument
         Revision++;
         DrawingOperation forward = ops.Count == 1 && _batchLabel is null ? ops[0] : new BatchOperation(ops, _batchLabel);
         DrawingOperation inverse = inverses.Count == 1 && _batchLabel is null ? inverses[0] : new BatchOperation(inverses, _batchLabel);
-        Changed?.Invoke(this, new DocumentChangedEventArgs(forward, inverse, _batchOrigin, Revision));
+        Raise(forward, inverse, _batchOrigin);
     }
 
     private sealed class BatchScope(InkDocument document) : IDisposable
@@ -507,12 +543,11 @@ public sealed class InkDocument
 
     private void ValidateElement(InkElement element)
     {
-        Rect b = element.LocalBounds;
-        if (!float.IsFinite(b.X) || !float.IsFinite(b.Y) || !float.IsFinite(b.Width) || !float.IsFinite(b.Height))
-            throw new InvalidOperationException($"{element.TypeName} has non-finite bounds.");
-        float max = Limits.MaxCoordinate;
-        if (MathF.Abs(b.Left) > max || MathF.Abs(b.Top) > max || MathF.Abs(b.Right) > max || MathF.Abs(b.Bottom) > max)
-            throw new InvalidOperationException($"{element.TypeName} lies outside the allowed coordinate range (+/-{max}).");
+        // Both spaces are checked. Local bounds catch corrupt geometry, and document bounds catch a transform
+        // that scales modest local coordinates far outside the range: validating only the local box would let an
+        // imported document place elements millions of units away and make zoom-to-fit and export meaningless.
+        ValidateBounds(element, element.LocalBounds, "local");
+        if (!element.Transform.IsIdentity) ValidateBounds(element, element.Bounds, "document");
         if (element is Stroke stroke)
         {
             if (stroke.Points.Count > Limits.MaxPointsPerStroke) throw new InvalidOperationException($"Stroke has {stroke.Points.Count} points; the limit is {Limits.MaxPointsPerStroke}.");
@@ -520,6 +555,15 @@ public sealed class InkDocument
             if (stroke.Brush.Width > Limits.MaxStrokeWidth) throw new InvalidOperationException($"Brush width {stroke.Brush.Width} exceeds the limit of {Limits.MaxStrokeWidth}.");
             stroke.Brush.Validate();
         }
+    }
+
+    private void ValidateBounds(InkElement element, Rect b, string space)
+    {
+        if (!float.IsFinite(b.X) || !float.IsFinite(b.Y) || !float.IsFinite(b.Width) || !float.IsFinite(b.Height))
+            throw new InvalidOperationException($"{element.TypeName} has non-finite {space} bounds.");
+        float max = Limits.MaxCoordinate;
+        if (MathF.Abs(b.Left) > max || MathF.Abs(b.Top) > max || MathF.Abs(b.Right) > max || MathF.Abs(b.Bottom) > max)
+            throw new InvalidOperationException($"{element.TypeName} lies outside the allowed {space} coordinate range (+/-{max}).");
     }
 
     /// <summary>

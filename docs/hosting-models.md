@@ -80,4 +80,5 @@ reason, so an application can tell the user something useful.
 ## Content security policy
 
 The component needs no `eval` and no inline script. It loads one module from your own origin. A policy of
-`script-src 'self'` is enough. If you serve static web assets from a CDN, allow that origin.
+`script-src 'self'` is enough for it, and because the Blazor initializer also injects a stylesheet link from
+the same origin, so is `style-src 'self'`. If you serve static web assets from a CDN, allow that origin.

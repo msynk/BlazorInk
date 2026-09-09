@@ -75,7 +75,23 @@ point data with the document.
 Changes made with origin `Remote` or `Load` are not recorded: a collaborator's edit belongs to their history, not
 yours. Undo and redo are re-broadcast to collaborators as ordinary edits, because that is what they are.
 
-`BeginGroup` merges a gesture's many operations, such as every frame of a drag, into a single undo step.
+`BeginGroup` merges a gesture's many operations, such as every frame of a drag, into a single undo step. Every
+tool uses it for pointer gestures and for keyboard edits alike.
+
+### Changes caused by other changes
+
+An application often keeps derived geometry in sync: a diagram re-routes a connector when the node it is attached
+to moves. It does that by handling `Changed` and applying more operations, and those operations must undo with
+the change that caused them, not before it.
+
+The document reports that relationship. A change applied while another change is being reported is nested inside
+it, and its `DocumentChangedEventArgs.Depth` is greater than zero. History holds those consequential entries back
+until the whole notification has finished and then records them after their cause, so the result does not depend
+on whether the application subscribed to `Changed` before or after the history manager did. With a group open, as
+during any gesture, the cause and its consequences become one undo step.
+
+The demo's diagram page is built on exactly this: moving a node and re-routing its four connectors is a single
+undo, and it is covered by tests at both the model and browser level.
 
 ## Rendering
 

@@ -1,8 +1,9 @@
 @inherits LayoutComponentBase
 
 <div class="app">
+    <a class="skip-link" href="#main">Skip to content</a>
     <NavMenu />
-    <main class="main">
+    <main class="main" id="main" tabindex="-1">
         @Body
     </main>
 </div>

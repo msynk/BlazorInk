@@ -39,6 +39,9 @@ public sealed class EraserTool : DrawTool
     private readonly List<Vector2> _path = new(64);
     private readonly List<Stroke> _fragments = new(4);
     private readonly List<Guid> _erasedThisGesture = new();
+    // Reused across the many move samples of one gesture: erasing runs on every pointer move, and a fresh list
+    // per sample is pure garbage on the hottest path the tool has.
+    private readonly List<DrawingOperation> _operations = new(8);
     private IDisposable? _historyGroup;
     private bool _erasing;
     private int _pointerId = -1;
@@ -125,7 +128,8 @@ public sealed class EraserTool : DrawTool
     {
         ArgumentNullException.ThrowIfNull(context);
         if (_activeMode == EraserMode.Pixel) { base.OnPointerCancel(context, sample); return; }
-        if (!_erasing) return;
+        // Only the contact that started the gesture can end it; see DrawTool.OnPointerCancel.
+        if (!_erasing || sample.PointerId != _pointerId) return;
         context.ReleasePointer(sample.PointerId);
         EndGesture(context);
     }
@@ -160,7 +164,8 @@ public sealed class EraserTool : DrawTool
         ReadOnlySpan<Vector2> segment = path.Length >= 2 ? path[^2..] : path;
         Rect area = GeometryMath.Bounds(segment).Inflate(Radius);
 
-        var operations = new List<DrawingOperation>();
+        List<DrawingOperation> operations = _operations;
+        operations.Clear();
         foreach (Layer layer in document.Layers)
         {
             if (layer.IsLocked || !layer.IsVisible) continue;
@@ -195,7 +200,8 @@ public sealed class EraserTool : DrawTool
         if (operations.Count == 0) return;
         try
         {
-            document.Apply(operations.Count == 1 ? operations[0] : new BatchOperation(operations, "Erase"));
+            // BatchOperation keeps the list it is given, so the reused buffer is copied before handing it over.
+            document.Apply(operations.Count == 1 ? operations[0] : new BatchOperation([.. operations], "Erase"));
         }
         catch (InvalidOperationException ex)
         {

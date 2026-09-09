@@ -112,7 +112,7 @@ Measured on a synthetic handwriting document of 10,000 strokes with 60 points ea
 | Compact, base64 binary points | about 8 bytes per point including base64 expansion and all JSON overhead |
 | Readable, JSON number arrays | several times larger |
 
-The collaboration benchmark asserts the compact figure: a stroke costs under 14 bytes per point on the wire,
+A collaboration test asserts the compact figure: a stroke costs under 14 bytes per point on the wire,
 including the operation wrapper.
 
 ## Custom data

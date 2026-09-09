@@ -22,7 +22,10 @@
     {
         @* Text editing needs a real input: a canvas cannot offer selection, an IME, autocorrect or a screen
            reader. The textarea sits exactly over the element being edited. *@
-        <textarea class="blazorink-text-editor"
+        @* The key matters: without it Blazor reuses the same textarea for the next element, and the browser's
+           dirty-value flag keeps showing the text typed into the previous one. *@
+        <textarea @key="editor.ElementId"
+                  class="blazorink-text-editor"
                   style="@editor.Style"
                   aria-label="Edit text"
                   @ref="_textEditorElement">@editor.Text</textarea>

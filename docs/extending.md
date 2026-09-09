@@ -1,6 +1,6 @@
 # Extending the framework
 
-Five extension points cover the things applications actually need to change. Each is a small interface or an
+Six extension points cover the things applications actually need to change. Each is a small interface or an
 abstract record, and none of them requires touching the engine.
 
 ## A custom brush
@@ -54,6 +54,11 @@ need them for a chisel nib or a calligraphic brush.
 ## A custom tool
 
 Implement `ITool`, or derive from `ToolBase` and override only what you need.
+
+For a worked example larger than the snippet below, read `samples/BlazorInk.Demo/Diagramming`. It builds a whole
+node-and-connector diagram surface out of the public API alone: two tools, element metadata for the graph
+structure, and a listener that re-routes connectors when a node moves. The framework has no idea what a diagram
+is, and nothing in it needed changing.
 
 ```csharp
 public sealed class DotTool : ToolBase

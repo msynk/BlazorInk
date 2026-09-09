@@ -15,8 +15,18 @@
 }
 
 .blazorink-canvas:focus-visible {
-  outline: 2px solid Highlight;
+  /* Two rings, one dark and one light, so the indicator stays visible against any drawing or page background.
+     Under forced colours the system takes over and Highlight is the right answer. */
+  outline: 2px solid #1d4ed8;
   outline-offset: 2px;
+  box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.9);
+}
+
+@media (forced-colors: active) {
+  .blazorink-canvas:focus-visible {
+    outline: 3px solid Highlight;
+    box-shadow: none;
+  }
 }
 
 .blazorink-layer {

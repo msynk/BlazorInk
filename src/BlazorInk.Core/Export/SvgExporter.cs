@@ -395,7 +395,7 @@ public static class SvgExporter
             if (selection is not null && !selection.Contains(element.Id) && element is not Stroke { IsEraser: true }) continue;
             result.Add(element);
         }
-        // Trailing erasers with nothing left to erase only bloat the output.
+        // Leading erasers have nothing below them to erase and would only bloat the output.
         while (result.Count > 0 && result[0] is Stroke { IsEraser: true }) result.RemoveAt(0);
         return result;
     }

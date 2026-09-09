@@ -12,7 +12,7 @@
 <div class="panel" style="padding:1rem">
     @* A host that reads canvas state (such as the undo button below) re-renders on this callback.
        Pointer input itself never re-renders anything. *@
-    <InkCanvas @ref="_canvas" Height="260px" Brush="_brush" AriaLabel="Try drawing here"
+    <InkCanvas @ref="_canvas" Height="260px" EnableTouchGestures="true" Brush="_brush" AriaLabel="Try drawing here"
                DocumentChanged="() => StateHasChanged()" />
 </div>
 <div class="toolbar" style="border:1px solid var(--border);border-top:none;border-radius:0 0 10px 10px">
@@ -35,6 +35,10 @@
     <a class="card" href="whiteboard">
         <h3>Whiteboard</h3>
         <p>Pens, markers, highlighters, shapes, text, selection, layers, pan and zoom.</p>
+    </a>
+    <a class="card" href="diagram">
+        <h3>Diagram surface</h3>
+        <p>Nodes and connectors that stay attached when you move things, on a snapping grid.</p>
     </a>
     <a class="card" href="image-annotation">
         <h3>Image annotation</h3>

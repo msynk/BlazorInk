@@ -37,6 +37,7 @@ public static class DocumentRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(context);
         options ??= RenderOptions.Default;
+        options = WithIndexedFilter(options);
         int drawn = 0;
         foreach (Layer layer in document.Layers)
         {
@@ -51,7 +52,7 @@ public static class DocumentRenderer
     {
         ArgumentNullException.ThrowIfNull(layer);
         ArgumentNullException.ThrowIfNull(context);
-        options ??= RenderOptions.Default;
+        options = WithIndexedFilter(options ?? RenderOptions.Default);
         if (layer.Count == 0) return 0;
 
         bool isolate = layer.Opacity < 1f || LayerHasEraser(layer);
@@ -74,6 +75,20 @@ public static class DocumentRenderer
 
         if (isolate) context.PopGroup();
         return drawn;
+    }
+
+    /// <summary>
+    /// Ensures the element filter can be probed in constant time. The filter arrives as a collection because
+    /// that is what callers have (the selection hands out an array), and probing an array once per element turns
+    /// a redraw into a quadratic scan: exporting a thousand selected elements out of ten thousand would compare
+    /// ids ten million times.
+    /// </summary>
+    private static RenderOptions WithIndexedFilter(RenderOptions options)
+    {
+        IReadOnlyCollection<Guid>? filter = options.ElementFilter;
+        // A handful of ids is faster to scan than to hash, and the common sets are already hash based.
+        if (filter is null || filter.Count <= 8 || filter is HashSet<Guid> or IReadOnlySet<Guid>) return options;
+        return options with { ElementFilter = new HashSet<Guid>(filter) };
     }
 
     private static bool LayerHasEraser(Layer layer)

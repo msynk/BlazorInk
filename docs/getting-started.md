@@ -10,6 +10,10 @@ Add the namespace to `_Imports.razor`:
 
 ```razor
 @using BlazorInk
+@using BlazorInk.Brushes
+@using BlazorInk.Geometry
+@using BlazorInk.Rendering
+@using BlazorInk.Tools
 ```
 
 The component's stylesheet is injected automatically when the app starts. If you prefer to control it, add the
@@ -25,7 +29,7 @@ link yourself and the automatic injection stands down:
 <InkCanvas Height="400px" />
 ```
 
-That is a working canvas: pointer, touch and stylus input, pressure-aware ink, undo and redo on the keyboard.
+That is a working canvas: pointer and stylus input, and touch as soon as you set `EnableTouchGestures`, pressure-aware ink, undo and redo on the keyboard.
 
 ## A signature field
 

@@ -34,16 +34,16 @@ nothing, and optional channels are only allocated when the device produces them.
 
 ## Measured results
 
-Taken on .NET 10, x64, a desktop machine. Absolute numbers depend on hardware; the ratios and the allocation
+Taken on .NET 10, x64, a desktop machine. Sizes are binary: MB means 2^20 bytes, as BenchmarkDotNet reports it. Absolute numbers depend on hardware; the ratios and the allocation
 figures are the meaningful part.
 
 ### Input, the per-frame hot path
 
 | Samples per frame | Time | Allocated |
 | --- | --- | --- |
-| 4 | 76 ns | 0 B |
-| 16 | 314 ns | 0 B |
-| 64 | 1.2 us | 0 B |
+| 4 | 81 ns | 0 B |
+| 16 | 299 ns | 0 B |
+| 64 | 1.24 us | 0 B |
 
 Sixty-four samples is a 240 Hz pen with coalescing on a slow frame. Processing them costs about one hundredth of
 a 16 ms frame budget and allocates nothing, so drawing produces no garbage collection pressure.
@@ -80,10 +80,10 @@ Document of 10,000 strokes, 600,000 points:
 | Operation | Time | Allocated |
 | --- | --- | --- |
 | Save | 28 ms | 22 MB |
-| Load | 72 ms | 23 MB |
+| Load | 72 ms | 22 MB |
 | Encode 10,000 points | 81 us | 101 KB |
 | Decode 10,000 points | 55 us | 156 KB |
-| Export SVG | 569 ms | 150 MB |
+| Export SVG | 569 ms | 146 MB |
 
 SVG export is the expensive one, and inherently so: 600,000 points become about 35 million characters of path
 data. Most of that memory is the string itself, twice over, because `Export` returns one. Use the streaming

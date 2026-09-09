@@ -50,7 +50,15 @@ public sealed class PanTool : ToolBase
     public override void OnPointerMove(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (!_pointers.ContainsKey(sample.PointerId)) return;
+        if (!_pointers.ContainsKey(sample.PointerId))
+        {
+            // A contact can join a gesture that is already running, either because a host routed an existing
+            // touch here after deciding it was a two-finger gesture, or because the down event was consumed
+            // elsewhere. Adopting it silently and re-basing the gesture avoids a jump on the next move.
+            _pointers[sample.PointerId] = sample.Position;
+            UpdateGesture();
+            return;
+        }
         _pointers[sample.PointerId] = sample.Position;
 
         (Vector2 centroid, float spread) = GetGesture();

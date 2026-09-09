@@ -64,6 +64,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private bool _renderScheduled;
     private bool _uiDirty;
     private bool _disposed;
+    private readonly PanTool _touchGesture = new();
+    private readonly Dictionary<int, Vector2> _touchPoints = [];
+    private bool _gestureRouting;
+    private bool _selectionActiveSent;
     private string _announcement = string.Empty;
     private string _cursor = "crosshair";
     private ITool? _previousToolParameter;
@@ -74,6 +78,8 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private bool _watchForAddedStroke;
     private ElementReference _textEditorElement;
     private bool _focusTextEditor;
+    private bool _firstRenderDone;
+    private (InkColor? Color, float Width, float Opacity)? _wetInkSent;
 
     /// <summary>Creates the component.</summary>
     public InkCanvas()
@@ -287,7 +293,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     public void SetViewport(Viewport viewport)
     {
         if (_viewport == viewport) return;
+        float previousZoom = _viewport.Zoom;
         _viewport = viewport;
+        // The provisional trail is drawn in the browser in view pixels, so its width has to follow the zoom.
+        if (previousZoom != viewport.Zoom) _ = UpdateWetInkStyleAsync();
         InvalidateAll();
         if (ViewportChanged.HasDelegate) _ = ViewportChanged.InvokeAsync(viewport);
     }
@@ -344,7 +353,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if ((long)width * height > options.MaxPixels)
             throw new InvalidOperationException($"Exporting {width} by {height} pixels exceeds the limit of {options.MaxPixels} pixels. Lower the scale or export a smaller region.");
 
-        var context = new CanvasRenderContext(Math.Max(4096, _document.ElementCount * 64));
+        // Pre-sizing avoids repeated growth on a typical export. It is capped because the buffer grows on demand
+        // anyway, and sizing it from the element count alone would put a very large document straight on the
+        // large object heap before a single command has been recorded.
+        var context = new CanvasRenderContext(Math.Clamp(_document.ElementCount * 64, 4096, 1 << 20));
         InkColor background = options.Background ?? _document.Settings.Background;
         if (!background.IsTransparent) context.Clear(background);
         context.SetTransform(Matrix3x2.CreateTranslation(-region.X, -region.Y) * Matrix3x2.CreateScale(scale));
@@ -441,8 +453,12 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     /// <summary>Announces a message to screen readers through the canvas live region.</summary>
     public void Announce(string message)
     {
-        if (string.IsNullOrWhiteSpace(message) || _announcement == message) return;
-        _announcement = message;
+        if (string.IsNullOrWhiteSpace(message)) return;
+        // An identical string would not change the live region's text node, and screen readers announce changes.
+        // Repeating an action (erasing three strokes twice) must not fall silent, so the text is alternated with
+        // a trailing space that is invisible to a reader but is a change to the DOM.
+        string text = _announcement is not null && _announcement.TrimEnd() == message ? message + ' ' : message;
+        _announcement = text;
         _uiDirty = true;
         ScheduleRender();
     }
@@ -481,7 +497,11 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             SetTool(Tool);
         }
 
-        if (Brush is not null && !Equals(Brush, _brush)) _brush = Brush;
+        if (Brush is not null && !Equals(Brush, _brush))
+        {
+            _brush = Brush;
+            _ = UpdateWetInkStyleAsync();
+        }
         if (ShapeStyle is not null) _shapeStyle = ShapeStyle;
         if (ActiveLayerId is { } layerId && _document.TryGetLayer(layerId, out _)) _activeLayerId = layerId;
         // Only follow the parameter when the parent actually changed it. Comparing against the current viewport
@@ -491,8 +511,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             _previousViewportParameter = Viewport;
             if (Viewport != default && Viewport != _viewport)
             {
-                _viewport = Viewport;
-                InvalidateAll();
+                SetViewport(Viewport);
             }
         }
         if (_history.Limit != HistoryLimit) _history.Limit = HistoryLimit;
@@ -501,7 +520,11 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     /// <inheritdoc />
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (firstRender) await AttachAsync().ConfigureAwait(false);
+        if (firstRender)
+        {
+            _firstRenderDone = true;
+            await AttachAsync().ConfigureAwait(false);
+        }
         if (_focusTextEditor && _textEditor is not null)
         {
             _focusTextEditor = false;
@@ -527,6 +550,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             var options = new InteropOptions
             {
                 RejectTouchWhilePen = RejectTouchWhilePen,
+                HandleKeyboard = EnableKeyboardShortcuts,
                 TrackHover = false,
                 WetInk = WetInk ?? !OperatingSystem.IsBrowser(),
             };
@@ -598,6 +622,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private void AttachDocument(InkDocument document)
     {
         if (_document is not null) _document.Changed -= OnDocumentChanged;
+        // Detach before disposing: disposing a history manager closes any open group, which can push an entry and
+        // raise Changed. Handling that while the fields are mid-swap would report the old manager's state.
+        if (_history is not null) _history.Changed -= OnHistoryChanged;
+        if (_selection is not null) _selection.Changed -= OnSelectionChanged;
         _history?.Dispose();
         _selection?.Dispose();
 
@@ -644,19 +672,26 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private void RaiseAsync(Func<Task> raise, bool hasDelegate)
     {
         if (!hasDelegate || _disposed) return;
-        _ = InvokeAsync(async () =>
+        try
         {
-            try
+            _ = InvokeAsync(async () =>
             {
-                await raise().ConfigureAwait(false);
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-            catch (JSDisconnectedException)
-            {
-            }
-        });
+                try
+                {
+                    await raise().ConfigureAwait(false);
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+                catch (JSDisconnectedException)
+                {
+                }
+            });
+        }
+        catch (ObjectDisposedException)
+        {
+            // The renderer is being torn down. There is nobody left to raise the event to.
+        }
     }
 
     /// <summary>Replaces the active tool.</summary>
@@ -696,8 +731,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     {
         if (_disposed) return;
 
-        // A read-only canvas still pans and zooms: only tools that change the document are blocked.
-        if (ReadOnly && _activeTool.ModifiesDocument)
+        // A read-only canvas still pans and zooms: only tools that change the document are blocked. Touch
+        // gestures are still routed, because they only move the viewport.
+        bool toolBlocked = ReadOnly && _activeTool.ModifiesDocument;
+        if (toolBlocked && !EnableTouchGestures)
         {
             CancelActiveGesture();
             return;
@@ -714,10 +751,72 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             // A tool that does not want intermediate samples still needs the last one before an up event,
             // so only interior coalesced move samples are dropped.
             if (!wantsAll && sample.IsCoalesced && sample.Phase == PointerPhase.Move && i < count - 1) continue;
+            if (EnableTouchGestures && RouteTouchGesture(sample)) continue;
+            if (toolBlocked) continue;
             Dispatch(sample);
         }
 
         _ = RenderDirtyAsync();
+    }
+
+    /// <summary>
+    /// Handles the second finger. A single contact belongs to whatever tool is active, but once a second one
+    /// arrives the gesture is almost always a pan or a pinch, whatever the tool is. The in-flight tool gesture is
+    /// cancelled and every remaining touch sample goes to an internal pan tool until the last finger lifts.
+    /// </summary>
+    /// <returns>True when the sample was consumed by the gesture and must not reach the active tool.</returns>
+    private bool RouteTouchGesture(in InputSample sample)
+    {
+        if (sample.Kind != PointerKind.Touch) return false;
+
+        switch (sample.Phase)
+        {
+            case PointerPhase.Down:
+                _touchPoints[sample.PointerId] = sample.Position;
+                if (!_gestureRouting && _touchPoints.Count >= 2)
+                {
+                    // Whatever the first finger started is abandoned rather than left half drawn.
+                    CancelActiveGesture();
+                    _gestureRouting = true;
+                    _touchGesture.Activate(_toolContext);
+                }
+                break;
+            case PointerPhase.Move:
+                if (_touchPoints.ContainsKey(sample.PointerId)) _touchPoints[sample.PointerId] = sample.Position;
+                break;
+            case PointerPhase.Up:
+            case PointerPhase.Cancel:
+                _touchPoints.Remove(sample.PointerId);
+                break;
+        }
+
+        if (!_gestureRouting) return false;
+
+        switch (sample.Phase)
+        {
+            case PointerPhase.Down:
+                _touchGesture.OnPointerDown(_toolContext, sample);
+                break;
+            case PointerPhase.Move:
+                _touchGesture.OnPointerMove(_toolContext, sample);
+                break;
+            case PointerPhase.Up:
+                _touchGesture.OnPointerUp(_toolContext, sample);
+                break;
+            case PointerPhase.Cancel:
+                _touchGesture.OnPointerCancel(_toolContext, sample);
+                break;
+        }
+
+        // The gesture ends when the last finger lifts, not when it drops back to one: continuing to pan with the
+        // remaining finger is what every touch application does, and switching back to drawing mid-gesture would
+        // leave a stray mark.
+        if (_touchPoints.Count == 0)
+        {
+            _gestureRouting = false;
+            _touchGesture.Deactivate(_toolContext);
+        }
+        return true;
     }
 
     private void Dispatch(in InputSample sample)
@@ -803,7 +902,23 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
 
     void IInkInteropClient.OnKey(string key, bool ctrl, bool shift, bool alt)
     {
-        if (_disposed || !EnableKeyboardShortcuts || ReadOnly) return;
+        if (_disposed || !EnableKeyboardShortcuts) return;
+
+        // A read-only canvas still pans and zooms, so the view shortcuts stay live; only editing is refused.
+        if (ReadOnly)
+        {
+            switch (key)
+            {
+                case "0" when ctrl: ResetViewport(); break;
+                case "9" when ctrl: ZoomToFit(); break;
+                case "+" or "=" when ctrl: ZoomBy(1.25f); break;
+                case "-" when ctrl: ZoomBy(0.8f); break;
+                case "Escape": _selection.Clear(); break;
+                default: return;
+            }
+            _ = RenderDirtyAsync();
+            return;
+        }
 
         var keyEvent = new ToolKeyEvent(key, ctrl, shift, alt);
         if (_activeTool.OnKeyDown(_toolContext, keyEvent))
@@ -887,7 +1002,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         TextStyle style = request.Element.Style;
         Rect box = request.ViewRect;
         float fontSize = style.FontSize * _viewport.Zoom;
-        string family = style.FontFamily.Replace("\"", string.Empty, StringComparison.Ordinal);
+        string family = SanitizeFontFamily(style.FontFamily);
         string weight = style.Bold ? "bold " : string.Empty;
         string italic = style.Italic ? "italic " : string.Empty;
         var culture = System.Globalization.CultureInfo.InvariantCulture;
@@ -896,11 +1011,58 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             $"left:{box.X:0.##}px;top:{box.Y:0.##}px;width:{MathF.Max(box.Width, fontSize * 4):0.##}px;height:{MathF.Max(box.Height, fontSize * style.LineHeight):0.##}px;font:{italic}{weight}{fontSize:0.##}px {family};line-height:{fontSize * style.LineHeight:0.##}px;color:{style.Color.ToCss()};");
     }
 
+    /// <summary>
+    /// Keeps a font family to characters that cannot end a CSS declaration. The value is written into the inline
+    /// style of the editor, so a family containing a semicolon or a url() would inject declarations of its own.
+    /// Documents loaded through <see cref="Serialization.InkSerializer"/> are already filtered; this covers styles
+    /// an application builds from its own user input.
+    /// </summary>
+    private static string SanitizeFontFamily(string family)
+    {
+        if (string.IsNullOrWhiteSpace(family)) return "sans-serif";
+        if (family.Length > 200) family = family[..200];
+        Span<char> buffer = family.Length <= 256 ? stackalloc char[family.Length] : new char[family.Length];
+        int n = 0;
+        foreach (char c in family)
+        {
+            if (char.IsLetterOrDigit(c) || c is ' ' or ',' or '-' or '_' or '.') buffer[n++] = c;
+        }
+        ReadOnlySpan<char> cleaned = buffer[..n].Trim();
+        return cleaned.IsEmpty ? "sans-serif" : new string(cleaned);
+    }
+
     private void OnTextEditFinished()
     {
         _textEditor = null;
         _uiDirty = true;
-        _ = InvokeAsync(StateHasChanged);
+        _ = InvokeAsync(async () =>
+        {
+            StateHasChanged();
+            await RestoreFocusAsync().ConfigureAwait(false);
+        });
+    }
+
+    /// <summary>
+    /// Returns focus to the canvas after the inline editor closes. Without this the textarea is removed from the
+    /// DOM and focus falls to the document body, leaving every canvas shortcut dead until the user tabs back.
+    /// </summary>
+    private async Task RestoreFocusAsync()
+    {
+        if (_disposed || !Focusable || !_attached) return;
+        try
+        {
+            await _container.FocusAsync(preventScroll: true).ConfigureAwait(false);
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (InvalidOperationException)
+        {
+            // The element reference is gone because the component is being removed. Nothing to focus.
+        }
     }
 
     /// <summary>
@@ -917,6 +1079,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             _textEditor = null;
             _uiDirty = true;
             ScheduleRender();
+            _ = InvokeAsync(RestoreFocusAsync);
             return;
         }
 
@@ -927,10 +1090,14 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private async Task CommitTextAsync(TextTool tool, string value)
     {
         Vector2? measured = await MeasureTextAsync(value, tool).ConfigureAwait(false);
+        // Measuring is a browser round trip. On Blazor Server the user can navigate away during it, and writing
+        // to a disposed document and history manager afterwards would throw on a fire-and-forget task.
+        if (_disposed) return;
         tool.CommitEdit(_toolContext, value, measured);
         _textEditor = null;
         _uiDirty = true;
         await RenderDirtyAsync().ConfigureAwait(false);
+        await RestoreFocusAsync().ConfigureAwait(false);
     }
 
     private async Task<Vector2?> MeasureTextAsync(string text, TextTool tool)
@@ -953,7 +1120,10 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
 
     private void ScheduleRender()
     {
-        if (_renderScheduled || !_attached || _disposed) return;
+        // Gated on the first render rather than on a successful attach: a canvas whose browser module was blocked
+        // still has to re-render its own markup, which is where the accessible description, the inline text editor
+        // and the live region live. Gating on _attached made that path unreachable and left them frozen.
+        if (_renderScheduled || _disposed || !_firstRenderDone) return;
         _renderScheduled = true;
         // Coalesces bursts of programmatic changes into one redraw without touching Blazor's render cycle.
         _ = InvokeAsync(async () =>
@@ -965,8 +1135,21 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
 
     private async Task RenderDirtyAsync()
     {
-        if (_interop is null || _disposed || !_attached) return;
+        if (_disposed) return;
         if (!_documentDirty && !_overlayDirty && !_uiDirty) return;
+
+        if (_interop is null || !_attached)
+        {
+            // Nothing can be painted, but the component still has to re-render: the inline text editor, the
+            // accessible description and the AttachFailed message all live in the component's own markup, and a
+            // canvas whose module was blocked would otherwise be silent as well as blank.
+            _documentDirty = false;
+            _overlayDirty = false;
+            if (!_uiDirty) return;
+            _uiDirty = false;
+            await InvokeAsync(StateHasChanged).ConfigureAwait(false);
+            return;
+        }
 
         try
         {
@@ -981,6 +1164,13 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
                 _overlayDirty = false;
                 RecordOverlay();
                 await _interop.ExecuteAsync(CanvasLayer.Overlay, _overlayContext).ConfigureAwait(false);
+            }
+            if (_selectionActiveSent != !_selection.IsEmpty)
+            {
+                // The browser layer decides synchronously, inside the key event, whether Delete and the arrow
+                // keys belong to the canvas or to the page. It can only do that if it knows about the selection.
+                _selectionActiveSent = !_selection.IsEmpty;
+                await _interop.SetSelectionActiveAsync(_selectionActiveSent).ConfigureAwait(false);
             }
             if (_uiDirty)
             {
@@ -1023,17 +1213,33 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         _activeTool.DrawOverlay(_toolContext, context);
     }
 
+    /// <summary>
+    /// Pushes the provisional-trail style to the browser. Called whenever the brush or the zoom changes, not only
+    /// at attach: the trail is drawn by JavaScript with whatever style it was last told, so a stale one would
+    /// draw the previous colour and width until the round trip to the server replaced it.
+    /// </summary>
     private async Task UpdateWetInkStyleAsync()
     {
-        if (_interop is null) return;
+        if (_interop is null || _disposed) return;
         bool enabled = WetInk ?? !OperatingSystem.IsBrowser();
-        if (!enabled)
+        InkColor? color = enabled ? _brush.Color : null;
+        float width = enabled ? MathF.Max(_brush.Width * _viewport.Zoom * 0.8f, 1f) : 0f;
+        float opacity = enabled ? _brush.Opacity : 0f;
+        if (_wetInkSent == (color, width, opacity)) return;
+        _wetInkSent = (color, width, opacity);
+        try
         {
-            await _interop.SetWetInkStyleAsync(null, 0, 0).ConfigureAwait(false);
-            return;
+            await _interop.SetWetInkStyleAsync(color, width, opacity).ConfigureAwait(false);
         }
-        float width = MathF.Max(_brush.Width * _viewport.Zoom * 0.8f, 1f);
-        await _interop.SetWetInkStyleAsync(_brush.Color, width, _brush.Opacity).ConfigureAwait(false);
+        catch (JSDisconnectedException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (TaskCanceledException)
+        {
+        }
     }
 
     private async Task EnsureImagesLoadedAsync(CancellationToken cancellationToken)

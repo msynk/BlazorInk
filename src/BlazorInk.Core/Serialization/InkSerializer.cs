@@ -168,7 +168,20 @@ public static class InkSerializer
     /// <param name="options">Deserialization options, including the limits applied to untrusted input.</param>
     /// <exception cref="InkFormatException">The JSON is not a valid element.</exception>
     public static InkElement? ReadElementFrom(JsonElement element, InkDeserializerOptions? options = null)
-        => ReadElement(element, options ?? InkDeserializerOptions.Default);
+    {
+        try
+        {
+            return ReadElement(element, options ?? InkDeserializerOptions.Default);
+        }
+        catch (InkFormatException)
+        {
+            throw;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException or OverflowException)
+        {
+            throw new InkFormatException("The element is malformed: " + ex.Message, ex);
+        }
+    }
 
     private static void WriteElement(Utf8JsonWriter writer, InkElement element, InkSerializerOptions options)
     {
@@ -470,7 +483,26 @@ public static class InkSerializer
         }
         using (json)
         {
-            return ReadDocument(json.RootElement, options);
+            try
+            {
+                return ReadDocument(json.RootElement, options);
+            }
+            catch (InkFormatException)
+            {
+                throw;
+            }
+            catch (JsonException ex)
+            {
+                throw new InkFormatException("The document is not valid JSON.", ex);
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException or OverflowException)
+            {
+                // Reading untrusted JSON reaches library code that reports malformed values in its own currency:
+                // a string that is not valid UTF-8 throws InvalidOperationException from JsonElement.GetString,
+                // an empty metadata key throws ArgumentException. Callers were promised one exception type, and
+                // TryDeserialize only catches that one, so anything else here would escape as an unhandled crash.
+                throw new InkFormatException("The document is malformed: " + ex.Message, ex);
+            }
         }
     }
 
@@ -496,9 +528,35 @@ public static class InkSerializer
     {
         document = null;
         error = null;
+        if (json is null)
+        {
+            error = "The document is null.";
+            return false;
+        }
         try
         {
             document = Deserialize(json, options);
+            return true;
+        }
+        catch (InkFormatException ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Tries to parse a document from UTF-8 bytes, returning false instead of throwing on malformed input. This is
+    /// the overload to use when loading a file: bytes read from disk or from a request body may not be valid UTF-8
+    /// at all, and decoding them to a string first would either throw or silently replace the invalid sequences.
+    /// </summary>
+    public static bool TryDeserialize(ReadOnlySpan<byte> utf8Json, out InkDocument? document, out string? error, InkDeserializerOptions? options = null)
+    {
+        document = null;
+        error = null;
+        try
+        {
+            document = Deserialize(utf8Json, options);
             return true;
         }
         catch (InkFormatException ex)
@@ -535,7 +593,8 @@ public static class InkSerializer
         {
             foreach (JsonProperty property in metadata.EnumerateObject())
             {
-                if (property.Value.ValueKind == JsonValueKind.String) document.SetMetadataCore(property.Name, property.Value.GetString());
+                // An empty key cannot be looked up again, so it is dropped rather than failing the whole load.
+                if (property.Name.Length > 0 && property.Value.ValueKind == JsonValueKind.String) document.SetMetadataCore(property.Name, property.Value.GetString());
             }
         }
 
@@ -914,7 +973,7 @@ public static class InkSerializer
         Dictionary<string, string>? result = null;
         foreach (JsonProperty property in metadata.EnumerateObject())
         {
-            if (property.Value.ValueKind != JsonValueKind.String) continue;
+            if (property.Name.Length == 0 || property.Value.ValueKind != JsonValueKind.String) continue;
             result ??= new Dictionary<string, string>(StringComparer.Ordinal);
             result[property.Name] = property.Value.GetString()!;
         }

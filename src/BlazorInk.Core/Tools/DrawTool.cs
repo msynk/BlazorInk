@@ -145,7 +145,10 @@ public class DrawTool : ToolBase
     public override void OnPointerCancel(IToolContext context, in InputSample sample)
     {
         ArgumentNullException.ThrowIfNull(context);
-        if (!_builder.IsActive) return;
+        // Only the contact that started the stroke can end it. A resting palm, a second finger the browser
+        // rejects, or a stray pointer leaving the element all raise a cancel of their own, and acting on those
+        // would throw away the stroke the user is still drawing.
+        if (!_builder.IsActive || sample.PointerId != _builder.PointerId) return;
         context.ReleasePointer(sample.PointerId);
         _builder.Cancel();
         ActiveBrush = null;

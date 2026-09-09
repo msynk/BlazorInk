@@ -20,18 +20,34 @@ public readonly record struct Viewport
     /// <summary>Identity viewport (zoom 1, no offset).</summary>
     public static readonly Viewport Identity = new(1f, Vector2.Zero);
 
+    private readonly float _zoom;
+    private readonly Vector2 _offset;
+
     /// <summary>Creates a viewport.</summary>
     public Viewport(float zoom, Vector2 offset)
     {
-        Zoom = zoom > 0 && float.IsFinite(zoom) ? zoom : 1f;
-        Offset = new Vector2(float.IsFinite(offset.X) ? offset.X : 0, float.IsFinite(offset.Y) ? offset.Y : 0);
+        Zoom = zoom;
+        Offset = offset;
     }
 
-    /// <summary>Scale factor (1 = one document unit per CSS pixel).</summary>
-    public float Zoom { get; init; }
+    /// <summary>
+    /// Scale factor (1 = one document unit per CSS pixel). Always positive and finite: a zero, negative or
+    /// non-finite value reads back as 1. The guard lives on the property rather than only in the constructor
+    /// because <c>default(Viewport)</c> and <c>viewport with { Zoom = ... }</c> both skip constructors, and a
+    /// zoom of zero would turn every document coordinate into infinity.
+    /// </summary>
+    public float Zoom
+    {
+        get => _zoom > 0f && float.IsFinite(_zoom) ? _zoom : 1f;
+        init => _zoom = value > 0f && float.IsFinite(value) ? value : 1f;
+    }
 
-    /// <summary>View position of the document origin, in CSS pixels.</summary>
-    public Vector2 Offset { get; init; }
+    /// <summary>View position of the document origin, in CSS pixels. Non-finite components read back as zero.</summary>
+    public Vector2 Offset
+    {
+        get => _offset;
+        init => _offset = new Vector2(float.IsFinite(value.X) ? value.X : 0f, float.IsFinite(value.Y) ? value.Y : 0f);
+    }
 
     /// <summary>Document to view transform.</summary>
     public Matrix3x2 DocumentToView => new(Zoom, 0, 0, Zoom, Offset.X, Offset.Y);
@@ -66,8 +82,7 @@ public readonly record struct Viewport
     {
         if (!(zoom > 0) || !float.IsFinite(zoom)) return this;
         Vector2 docAnchor = ToDocument(viewAnchor);
-        var next = new Viewport(zoom, Offset);
-        return next with { Offset = viewAnchor - docAnchor * zoom };
+        return new Viewport(zoom, viewAnchor - docAnchor * zoom);
     }
 
     /// <summary>Creates a viewport that fits a document rectangle inside a view size with padding.</summary>
