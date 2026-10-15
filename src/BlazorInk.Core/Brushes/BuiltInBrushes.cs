@@ -76,6 +76,9 @@ public sealed record MarkerBrush : Brush
     /// <inheritdoc />
     public override StrokeGeometry BuildGeometry(StrokePointsView points, PathBuilder builder)
         => CenterlineBrushes.Build(points, builder, Width, LineCap.Round, LineJoin.Round);
+
+    /// <inheritdoc />
+    public override Rect GetBounds(Rect pointBounds) => base.GetBounds(CenterlineBrushes.WithSplineOvershoot(pointBounds));
 }
 
 /// <summary>
@@ -106,6 +109,9 @@ public sealed record HighlighterBrush : Brush
     /// <inheritdoc />
     public override StrokeGeometry BuildGeometry(StrokePointsView points, PathBuilder builder)
         => CenterlineBrushes.Build(points, builder, Width, LineCap.Butt, LineJoin.Round);
+
+    /// <inheritdoc />
+    public override Rect GetBounds(Rect pointBounds) => base.GetBounds(CenterlineBrushes.WithSplineOvershoot(pointBounds));
 }
 
 /// <summary>
@@ -174,7 +180,20 @@ public static class CenterlineBrushes
         Span<System.Numerics.Vector2> pts = n <= 1024 ? stackalloc System.Numerics.Vector2[n] : new System.Numerics.Vector2[n];
         for (int i = 0; i < n; i++) pts[i] = points.PositionAt(i);
         builder.AddCatmullRom(pts);
-        float pad = width / 2f + 1f;
-        return new StrokeGeometry(builder.ToGeometry(), StrokeGeometryMode.Centerline, width, cap, join, points.Bounds.Inflate(pad));
+        // Round caps and joins stay within half the width of the centerline; square caps reach the corner of a
+        // half-width square and miter joins reach the miter limit (4, the SVG and raster default).
+        float reach = join == LineJoin.Miter ? 4f : cap == LineCap.Square ? MathF.Sqrt(2f) : 1f;
+        float pad = width / 2f * reach + 1f;
+        // The spline overshoots its points where the stroke turns sharply, so the points' bounds are too small.
+        // The curve stays inside the hull of its control points, which the builder's bounds cover.
+        return new StrokeGeometry(builder.ToGeometry(), StrokeGeometryMode.Centerline, width, cap, join, builder.Bounds.Inflate(pad));
     }
+
+    /// <summary>
+    /// Grows point bounds to cover the spline <see cref="Build"/> draws through them. A Catmull-Rom control point
+    /// sits at most a sixth of the distance between its neighbours away from its point, so the curve can leave the
+    /// points' bounds by up to a sixth of their size on each axis.
+    /// </summary>
+    internal static Rect WithSplineOvershoot(Rect pointBounds)
+        => pointBounds.IsUnset ? pointBounds : pointBounds.Inflate(pointBounds.Width / 6f, pointBounds.Height / 6f);
 }

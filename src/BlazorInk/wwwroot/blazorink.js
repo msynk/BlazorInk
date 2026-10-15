@@ -114,6 +114,11 @@ class Surface {
     this.wetInk = new Map();
     this.images = new Map();
     this.imagesUsedThisFrame = new Set();
+    this.pendingImages = new Set();
+    this.failedImages = new Set();
+    this.redrawRequested = false;
+    this.redrawHandle = 0;
+    this.pendingBlur = null;
     this.frameToken = 0;
     this.rectFrame = -1;
     this.cachedRect = null;
@@ -135,6 +140,8 @@ class Surface {
     this.onKeyDown = this.handleKeyDown.bind(this);
     this.onFocusOut = this.handleFocusOut.bind(this);
     this.onFrame = this.flush.bind(this);
+    this.onLostPointerCapture = this.handleLostPointerCapture.bind(this);
+    this.onContextRestored = () => this.requestRedraw();
 
     const target = this.hitTarget;
     target.addEventListener('pointerdown', this.onPointerDown);
@@ -142,9 +149,13 @@ class Surface {
     target.addEventListener('pointerup', this.onPointerUp);
     target.addEventListener('pointercancel', this.onPointerCancel);
     target.addEventListener('pointerleave', this.onPointerCancel);
+    target.addEventListener('lostpointercapture', this.onLostPointerCapture);
     target.addEventListener('contextmenu', this.onContextMenu);
     root.addEventListener('keydown', this.onKeyDown);
     root.addEventListener('focusout', this.onFocusOut);
+    // A browser may discard a canvas's backing store (GPU reset, a long-backgrounded tab on a phone) and later
+    // restore it blank. Nothing in the document changed, so without this nothing would ever repaint it.
+    for (const canvas of [this.documentCanvas, this.overlayCanvas]) canvas?.addEventListener('contextrestored', this.onContextRestored);
 
     this.resizeObserver = new ResizeObserver(() => this.notifyResize());
     this.resizeObserver.observe(root);
@@ -205,6 +216,16 @@ class Surface {
       canvas.style.height = `${cssHeight}px`;
     }
     this.scratchCanvases.length = 0;
+    // The first size comes from the measurement taken at attach. The resize observer's first report arrives before
+    // .NET has wired its callbacks, so a layout change in that window (a scrollbar appearing, a late stylesheet) was
+    // seen by nobody and the backing store would keep the stale size. Reporting a mismatch lets .NET correct it,
+    // and it settles at once because the corrected call carries the size measured here.
+    // Reported from a task of its own rather than from inside the call .NET is making.
+    const rect = this.root.getBoundingClientRect();
+    if (Math.abs(rect.width - cssWidth) > 0.5 || Math.abs(rect.height - cssHeight) > 0.5
+      || Math.abs((window.devicePixelRatio || 1) - dpr) > 0.001) {
+      setTimeout(() => this.notifyResize(), 0);
+    }
   }
 
   notifyResize() {
@@ -288,6 +309,7 @@ class Surface {
     for (const [pointerId, kind] of this.activePointers) {
       if (kind !== 'touch') continue;
       this.activePointers.delete(pointerId);
+      this.endWetInk(pointerId);
       this.push({
         pointerId,
         pointerType: 'touch',
@@ -350,6 +372,13 @@ class Surface {
     this.requestFlush();
   }
 
+  // Capture is released after pointerup and pointercancel, and by then the pointer is no longer active. Losing it
+  // while the pointer is still down means no pointerup will reach this element, so the gesture is cancelled rather
+  // than left active: a pen left marked active would otherwise reject every touch until the next pen contact.
+  handleLostPointerCapture(event) {
+    if (this.activePointers.has(event.pointerId)) this.handlePointerCancel(event);
+  }
+
   // Keyboard shortcuts travel the same path as pointer input, so the component never depends on a framework
   // event and never re-renders per keystroke.
   handleKeyDown(event) {
@@ -405,12 +434,33 @@ class Surface {
   }
 
   // Clicking away from an open editor commits what was typed, the way any text field behaves.
+  //
+  // The call into .NET is deferred to a microtask. Blazor's own DOM edits move focus (re-rendering or removing the
+  // editor fires focusout synchronously inside the render batch), and calling .NET from there fails in WebAssembly
+  // because the heap is locked for the batch. A microtask only runs once the whole call stack has unwound, which is
+  // after the batch has released the lock. It must not wait any longer than that: pressing a toolbar button moves
+  // focus on pointerdown, and its click, which may switch tools and close the editor, is the very next task, so a
+  // timer would report the typed text only after the editor it belonged to was gone.
   handleFocusOut(event) {
     if (this.disposed || !this.callback) return;
     const editor = this.textEditor();
     if (editor && event.target === editor) {
-      this.callback.textKey('Blur', editor.value);
+      const first = !this.pendingBlur;
+      this.pendingBlur = { editor, value: editor.value };
+      if (first) queueMicrotask(() => this.sendPendingBlur());
     }
+  }
+
+  // Also called at the start of a sample flush, so a click that moved focus out of the editor is reported to .NET
+  // before the pointer samples of that same click, the order the user performed them in.
+  sendPendingBlur() {
+    const pending = this.pendingBlur;
+    this.pendingBlur = null;
+    if (!pending || this.disposed || !this.callback) return;
+    // An editor Blazor removed was closed by .NET itself (a commit, a cancel, a tool change) or replaced by the
+    // editor for another element. Reporting its value now would commit it a second time, or onto the wrong element.
+    if (!pending.editor.isConnected || this.textEditor() !== pending.editor) return;
+    this.callback.textKey('Blur', pending.value);
   }
 
   requestFlush() {
@@ -428,6 +478,7 @@ class Surface {
     // Cleared unconditionally: samples collected before .NET attached its callback, or after a circuit dropped,
     // would otherwise accumulate for ever and grow the buffer without bound.
     this.sampleCount = 0;
+    if (this.pendingBlur) this.sendPendingBlur();
     if (this.disposed || !this.callback || count === 0) return;
     this.callback.samples(this.samples, count);
   }
@@ -640,6 +691,7 @@ class Surface {
             this.images.set(uri, image);
             this.imagesUsedThisFrame.add(uri);
           }
+          else this.requestImage(uri);
           if (image && image.complete && image.naturalWidth > 0) {
             ctx.globalAlpha = alpha;
             if (hasCrop) ctx.drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh);
@@ -729,10 +781,41 @@ class Surface {
     });
     image.src = uri;
     await loaded;
+    if (this.disposed) return { width: image.naturalWidth, height: image.naturalHeight };
     this.images.delete(uri);
     this.images.set(uri, image);
     this.evictImages();
     return { width: image.naturalWidth, height: image.naturalHeight };
+  }
+
+  // An image the document draws but this surface has not decoded: one added with a known size, or arriving with a
+  // loaded document, a collaborator's edit or an undo, or one evicted from the cache. It is fetched once, and the
+  // canvas is redrawn when it arrives. A failed URI is not retried on every frame.
+  requestImage(uri) {
+    if (this.disposed || !uri || this.pendingImages.has(uri) || this.failedImages.has(uri)) return;
+    this.pendingImages.add(uri);
+    this.loadImage(uri).then(
+      () => {
+        this.pendingImages.delete(uri);
+        this.requestRedraw();
+      },
+      () => {
+        this.pendingImages.delete(uri);
+        if (this.failedImages.size >= MAX_CACHED_IMAGES) this.failedImages.clear();
+        this.failedImages.add(uri);
+      });
+  }
+
+  // Only .NET can re-record the document, so it is asked to; coalesced to one request per frame, so a document
+  // with many images is not redrawn once per image.
+  requestRedraw() {
+    if (this.disposed || this.redrawRequested) return;
+    this.redrawRequested = true;
+    this.redrawHandle = requestAnimationFrame(() => {
+      this.redrawRequested = false;
+      this.redrawHandle = 0;
+      if (!this.disposed && this.callback && this.callback.redraw) this.callback.redraw();
+    });
   }
 
   // Drops the least recently used decoded bitmaps. Anything the last frame drew is kept whatever the cache size
@@ -770,11 +853,18 @@ class Surface {
     target.removeEventListener('pointerup', this.onPointerUp);
     target.removeEventListener('pointercancel', this.onPointerCancel);
     target.removeEventListener('pointerleave', this.onPointerCancel);
+    target.removeEventListener('lostpointercapture', this.onLostPointerCapture);
     target.removeEventListener('contextmenu', this.onContextMenu);
     this.root.removeEventListener('keydown', this.onKeyDown);
     this.root.removeEventListener('focusout', this.onFocusOut);
+    for (const canvas of [this.documentCanvas, this.overlayCanvas]) canvas?.removeEventListener('contextrestored', this.onContextRestored);
     if (this.frameHandle) cancelAnimationFrame(this.frameHandle);
     this.frameHandle = 0;
+    if (this.redrawHandle) cancelAnimationFrame(this.redrawHandle);
+    this.redrawHandle = 0;
+    this.pendingImages.clear();
+    this.failedImages.clear();
+    this.pendingBlur = null;
     this.resizeObserver?.disconnect();
     this.stopWatchingPixelRatio();
     this.images.clear();
@@ -843,7 +933,15 @@ export function setDotNetCallbacks(id, reference) {
     resized: (width, height, dpr) => reference.invokeMethodAsync('OnResized', width, height, dpr).catch(report('resize')),
     key: (key, ctrl, shift, alt) => reference.invokeMethodAsync('OnKeyDown', key, ctrl, shift, alt).catch(report('keyboard input')),
     textKey: (key, value) => reference.invokeMethodAsync('OnTextEditorKey', key, value ?? '').catch(report('text editing')),
+    redraw: () => reference.invokeMethodAsync('OnRedrawRequested').catch(report('redraw')),
   };
+}
+
+// Options that follow component parameters after attach. Without this, turning keyboard shortcuts off at runtime
+// would leave the browser layer preventing the default action of the keys it used to own.
+export function setOptions(id, options) {
+  const surface = surfaces.get(id);
+  if (surface && options) surface.options = { ...surface.options, ...options };
 }
 
 export function setSize(id, cssWidth, cssHeight, dpr) {

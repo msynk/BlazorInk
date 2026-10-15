@@ -1,4 +1,5 @@
 @page "/handwriting"
+@using BlazorInk.Export
 
 <PageTitle>Handwriting</PageTitle>
 
@@ -20,13 +21,7 @@
             }
         </div>
         <div class="toolbar-separator"></div>
-        <div class="toolbar-group" role="group" aria-label="Ink colour">
-            @foreach (string color in Palette)
-            {
-                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
-                        aria-label="@color" @onclick="() => SetColor(color)"></button>
-            }
-        </div>
+        <ColorSwatches Colors="Palette" Value="@_color" ValueChanged="SetColor" Label="Ink colour" />
         <div class="toolbar-separator"></div>
         <label class="field">
             Size
@@ -40,11 +35,12 @@
         <div class="toolbar-spacer"></div>
         <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)" @onclick="() => _canvas?.Undo()">Undo</button>
         <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)" @onclick="() => _canvas?.Redo()">Redo</button>
-        <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+        <button type="button" class="btn danger" disabled="@(_canvas is null || _canvas.CurrentDocument.IsEmpty)" @onclick="() => _canvas?.Clear()">Clear</button>
+        <button type="button" class="btn" disabled="@(_canvas is null || _canvas.CurrentDocument.IsEmpty)" @onclick="DownloadPngAsync">Download PNG</button>
     </div>
 
     <div style="@(_ruled ? RuledBackground : null)">
-        <InkCanvas @ref="_canvas"
+        <InkCanvas @ref="_canvas" HistoryChanged="() => StateHasChanged()"
                    EnableTouchGestures="true"
                    Height="420px"
                    Brush="_brush"
@@ -137,6 +133,9 @@
     }
 
     private void OnRuledChanged(ChangeEventArgs e) => _ruled = e.Value is true;
+
+    private Task DownloadPngAsync()
+        => _canvas?.SavePngAsync("notes.png", new PngExportOptions { Region = ExportRegion.Content, Padding = 16f, Scale = 2f }) ?? Task.CompletedTask;
 
     private void OnStrokeCompleted(StrokeEventArgs args)
     {

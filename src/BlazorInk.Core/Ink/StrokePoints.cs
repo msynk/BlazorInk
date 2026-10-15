@@ -143,7 +143,8 @@ public sealed class StrokePoints
         if (y.Length != n) throw new ArgumentException("X and Y must have the same length.", nameof(y));
         if (!pressure.IsEmpty && pressure.Length != n) throw new ArgumentException("Pressure length must match X.", nameof(pressure));
         if (!time.IsEmpty && time.Length != n) throw new ArgumentException("Time length must match X.", nameof(time));
-        if (!tiltX.IsEmpty && (tiltX.Length != n || tiltY.Length != n)) throw new ArgumentException("Tilt lengths must match X.", nameof(tiltX));
+        // Tilt is one channel: supplying only one axis would store an orphan array that Channels does not report.
+        if ((!tiltX.IsEmpty || !tiltY.IsEmpty) && (tiltX.Length != n || tiltY.Length != n)) throw new ArgumentException("Tilt lengths must match X.", nameof(tiltX));
         if (!twist.IsEmpty && twist.Length != n) throw new ArgumentException("Twist length must match X.", nameof(twist));
 
         float[] p = pressure.IsEmpty ? Filled(n, 0.5f) : pressure.ToArray();

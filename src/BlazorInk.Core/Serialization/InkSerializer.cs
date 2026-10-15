@@ -579,10 +579,12 @@ public static class InkSerializer
         DocumentSettings settings = DocumentSettings.Default;
         if (root.TryGetProperty("settings", out JsonElement settingsElement) && settingsElement.ValueKind == JsonValueKind.Object)
         {
+            // Clamped exactly as UpdateSettings clamps them: a page size is a coordinate like any other, and a
+            // file must not be able to declare a page no edit could ever produce.
             settings = new DocumentSettings
             {
-                Width = ReadFloat(settingsElement, "width", 800f),
-                Height = ReadFloat(settingsElement, "height", 600f),
+                Width = Math.Clamp(ReadFloat(settingsElement, "width", 800f), 0f, options.Limits.MaxCoordinate),
+                Height = Math.Clamp(ReadFloat(settingsElement, "height", 600f), 0f, options.Limits.MaxCoordinate),
                 Background = ReadColor(settingsElement, "background", InkColor.White),
             };
         }

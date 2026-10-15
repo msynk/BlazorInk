@@ -63,6 +63,7 @@ public sealed class InkDocument
     private string? _batchLabel;
     private long _totalPoints;
     private int _dispatchDepth;
+    private bool _keepRemoteVersions;
 
     /// <summary>Creates a document with default settings and one layer named "Drawing".</summary>
     public InkDocument() : this(DocumentSettings.Default) { }
@@ -184,6 +185,15 @@ public sealed class InkDocument
     /// <summary>Gets the layer containing an element.</summary>
     public Layer? GetLayerOf(Guid elementId) => _elementLayers.GetValueOrDefault(elementId);
 
+    /// <summary>
+    /// Gets a layer for a mutation. A missing layer is an operation that cannot be applied, reported the way
+    /// <see cref="Apply(DrawingOperation, ChangeOrigin)"/> documents (<see cref="InvalidOperationException"/>), so history, tools and
+    /// collaboration, which all refuse a stale operation by catching that, do not crash on a
+    /// <see cref="KeyNotFoundException"/> when a collaborator or an undo removed the layer.
+    /// </summary>
+    private Layer RequireLayer(Guid layerId)
+        => TryGetLayer(layerId, out Layer? layer) ? layer : throw new InvalidOperationException($"Layer {layerId} is not in the document.");
+
     // ---- Mutation API -----------------------------------------------------------------------------------------------
 
     /// <summary>Applies an operation and raises <see cref="Changed"/>. Returns the inverse operation.</summary>
@@ -199,8 +209,24 @@ public sealed class InkDocument
         // carries the same version that ends up in the document. A collaborator receiving an operation whose
         // version is lower than what the sender actually stored would discard it, and the two replicas would
         // never agree again.
-        operation = AssignVersions(operation);
-        DrawingOperation inverse = operation.ApplyCore(this);
+        //
+        // A remote edit has already won last-writer-wins at the version it carries, so it is stored at exactly
+        // that version even when it ties with the current one. Bumping it would leave this replica one version
+        // ahead of the others for the same content, and the next edit from a third participant would then be
+        // ordered differently here than everywhere else.
+        bool remote = origin == ChangeOrigin.Remote;
+        operation = AssignVersions(operation, remote, operation is BatchOperation ? new Dictionary<Guid, int>() : null);
+        bool keepRemoteVersions = _keepRemoteVersions;
+        _keepRemoteVersions = remote;
+        DrawingOperation inverse;
+        try
+        {
+            inverse = operation.ApplyCore(this);
+        }
+        finally
+        {
+            _keepRemoteVersions = keepRemoteVersions;
+        }
         if (_batchDepth > 0)
         {
             _batch!.Add(operation);
@@ -372,21 +398,39 @@ public sealed class InkDocument
     /// Returns the operation with element versions filled in from the document's current state. Only replacements
     /// need this: every other operation already carries whatever version its element should keep.
     /// </summary>
-    private DrawingOperation AssignVersions(DrawingOperation operation)
+    /// <remarks>
+    /// Inside a batch the same element can be replaced several times (redoing a drag replays every frame), and
+    /// each replacement is stored one version above the previous one. <paramref name="versions"/> carries the
+    /// versions given out so far in the batch, so the versions reported match the versions stored; deciding each
+    /// one from the document's state before the batch would report the same version for every frame.
+    /// </remarks>
+    private DrawingOperation AssignVersions(DrawingOperation operation, bool remote, Dictionary<Guid, int>? versions)
     {
         switch (operation)
         {
-            case ReplaceElementOperation replace when TryGetElement(replace.Element.Id, out InkElement? current):
+            case ReplaceElementOperation replace:
             {
-                if (replace.Element.Version > current.Version) return replace;
-                return new ReplaceElementOperation(replace.Element with { Version = current.Version + 1 });
+                Guid id = replace.Element.Id;
+                int current;
+                if (versions is not null && versions.TryGetValue(id, out int pending)) current = pending;
+                else if (TryGetElement(id, out InkElement? existing)) current = existing.Version;
+                else return replace;
+                int version = replace.Element.Version > current || (remote && replace.Element.Version == current) ? replace.Element.Version : NextVersion(current);
+                if (versions is not null) versions[id] = version;
+                return version == replace.Element.Version ? replace : new ReplaceElementOperation(replace.Element with { Version = version });
             }
+            case AddElementOperation add when versions is not null:
+                versions[add.Element.Id] = add.Element.Version;
+                return add;
+            case AddLayerOperation { Elements: { } elements } addLayer when versions is not null:
+                foreach (InkElement e in elements) versions[e.Id] = e.Version;
+                return addLayer;
             case BatchOperation batch:
             {
                 List<DrawingOperation>? rewritten = null;
                 for (int i = 0; i < batch.Operations.Count; i++)
                 {
-                    DrawingOperation assigned = AssignVersions(batch.Operations[i]);
+                    DrawingOperation assigned = AssignVersions(batch.Operations[i], remote, versions);
                     if (!ReferenceEquals(assigned, batch.Operations[i]) && rewritten is null)
                     {
                         rewritten = new List<DrawingOperation>(batch.Operations.Count);
@@ -401,11 +445,24 @@ public sealed class InkDocument
         }
     }
 
+    /// <summary>
+    /// The version after <paramref name="version"/>. It saturates rather than wrapping: a version read from an
+    /// untrusted file or collaborator can be <see cref="int.MaxValue"/>, and wrapping to a negative number would
+    /// make every later edit of that element lose last-writer-wins on every other replica.
+    /// </summary>
+    private static int NextVersion(int version) => version == int.MaxValue ? int.MaxValue : version + 1;
+
+    /// <summary>
+    /// True while a failed <see cref="BatchOperation"/> undoes the part of itself that was applied. Replacements
+    /// then restore the previous element exactly, version included.
+    /// </summary>
+    internal bool Restoring { get; set; }
+
     // ---- Core mutations (called by operations) ------------------------------------------------------------------------
 
     internal void InsertElementCore(Guid layerId, InkElement element, int? index)
     {
-        Layer layer = GetLayer(layerId);
+        Layer layer = RequireLayer(layerId);
         if (_elementLayers.ContainsKey(element.Id)) throw new InvalidOperationException($"An element with id {element.Id} already exists in the document.");
         ValidateElement(element);
         if (_elementLayers.Count >= Limits.MaxElements) throw new InvalidOperationException($"The document limit of {Limits.MaxElements} elements was reached.");
@@ -447,8 +504,13 @@ public sealed class InkDocument
         }
 
         // Apply assigned the version already; anything reaching here with a stale one is a direct caller, and is
-        // still bumped so two versions of an element are never confused.
-        InkElement next = element.Version > previous.Version ? element : element with { Version = previous.Version + 1 };
+        // still bumped so two versions of an element are never confused. Two cases keep the version they carry: a
+        // remote edit that tied and won (see Apply), and the rollback of a failed batch, which must put the
+        // element back exactly as it was or this replica's versions drift from everyone else's.
+        bool keep = element.Version > previous.Version
+            || Restoring
+            || (_keepRemoteVersions && element.Version == previous.Version);
+        InkElement next = keep ? element : element with { Version = NextVersion(previous.Version) };
         layer.MutableElements[index] = next;
         if (next is Stroke incoming) _totalPoints += incoming.Points.Count;
         return previous;
@@ -456,7 +518,7 @@ public sealed class InkDocument
 
     internal (Guid PreviousLayerId, int PreviousIndex) ReorderElementCore(Guid elementId, Guid targetLayerId, int? index)
     {
-        Layer target = GetLayer(targetLayerId);
+        Layer target = RequireLayer(targetLayerId);
         (Layer source, int previousIndex, InkElement element) = RemoveElementCore(elementId);
         List<InkElement> list = target.MutableElements;
         int at = index is null ? list.Count : Math.Clamp(index.Value, 0, list.Count);
@@ -473,12 +535,19 @@ public sealed class InkDocument
         if (_layers.Count >= Limits.MaxLayers) throw new InvalidOperationException($"The document limit of {Limits.MaxLayers} layers was reached.");
         if (elements is not null)
         {
+            // The elements arrive together, so they are checked against each other as well as the document: a
+            // repeated id would leave two elements behind one index entry, and validating each stroke against the
+            // document's point total alone would let one layer carry any number of points past the limit.
+            var ids = new HashSet<Guid>();
+            long points = 0;
             foreach (InkElement e in elements)
             {
-                if (_elementLayers.ContainsKey(e.Id)) throw new InvalidOperationException($"An element with id {e.Id} already exists in the document.");
+                if (_elementLayers.ContainsKey(e.Id) || !ids.Add(e.Id)) throw new InvalidOperationException($"An element with id {e.Id} already exists in the document.");
                 ValidateElement(e);
+                if (e is Stroke s) points += s.Points.Count;
             }
             if (_elementLayers.Count + elements.Count > Limits.MaxElements) throw new InvalidOperationException($"The document limit of {Limits.MaxElements} elements was reached.");
+            if (_totalPoints + points > Limits.MaxTotalPoints) throw new InvalidOperationException($"The document limit of {Limits.MaxTotalPoints} stroke points was reached.");
         }
         var layer = new Layer(layerId, properties, elements);
         int at = index is null ? _layers.Count : Math.Clamp(index.Value, 0, _layers.Count);
@@ -493,7 +562,7 @@ public sealed class InkDocument
 
     internal (int Index, Layer Layer) RemoveLayerCore(Guid layerId)
     {
-        Layer layer = GetLayer(layerId);
+        Layer layer = RequireLayer(layerId);
         if (_layers.Count == 1) throw new InvalidOperationException("A document must keep at least one layer.");
         int index = _layers.IndexOf(layer);
         _layers.RemoveAt(index);
@@ -509,7 +578,7 @@ public sealed class InkDocument
     internal LayerProperties UpdateLayerCore(Guid layerId, LayerProperties properties)
     {
         ArgumentNullException.ThrowIfNull(properties);
-        Layer layer = GetLayer(layerId);
+        Layer layer = RequireLayer(layerId);
         LayerProperties previous = layer.Properties;
         layer.Properties = properties with { Opacity = Math.Clamp(properties.Opacity, 0f, 1f), Name = properties.Name ?? string.Empty };
         return previous;
@@ -517,7 +586,7 @@ public sealed class InkDocument
 
     internal int ReorderLayerCore(Guid layerId, int index)
     {
-        Layer layer = GetLayer(layerId);
+        Layer layer = RequireLayer(layerId);
         int previous = _layers.IndexOf(layer);
         _layers.RemoveAt(previous);
         _layers.Insert(Math.Clamp(index, 0, _layers.Count), layer);

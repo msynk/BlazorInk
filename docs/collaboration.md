@@ -51,6 +51,10 @@ the sender from its own broadcasts. Each sender's messages must arrive in order,
 give you; a message that arrives after a later one from the same sender is discarded. Duplicates are harmless, and
 ordering between different senders does not matter.
 
+A message with a `RecipientId` is meant for that participant alone. A transport that can route, such as a SignalR
+hub sending to one connection, should deliver it only there; one that broadcasts everything is still correct,
+because a session ignores messages addressed to someone else.
+
 A SignalR implementation is about thirty lines: forward `SendAsync` to a hub method, raise `MessageReceived` from
 a hub callback, and raise `ConnectionChanged` from the connection's reconnect events.
 
@@ -93,7 +97,13 @@ Presence is throttled to `PresenceInterval` (50 ms by default), and stale partic
 
 While the transport is disconnected, operations are queued, up to `MaxOfflineQueue`. Presence is not queued,
 because stale presence is worse than none. When the transport reports a connection again, the queue is flushed in
-order.
+order. Presence shares the sequence numbers that order a participant's messages, so while operations are still
+queued, a presence update is held back and sent by the next `FlushPresenceAsync`; sending it first would make the
+others discard the queued operations as late arrivals.
+
+The session queues what it sends, not what it should have received. Messages sent to a participant while it is
+offline have to be kept by the server and delivered when it reconnects, or that participant asks for a snapshot
+after reconnecting to catch up.
 
 ```csharp
 if (!session.IsSynchronized)
@@ -104,8 +114,14 @@ if (!session.IsSynchronized)
 
 ## Joining
 
-A new participant asks for a snapshot; any existing participant answers with the serialized document, and the
-receiver applies it as a single batched change with origin `Remote`, so it does not land in their undo history.
+A new participant asks for a snapshot. Every participant that serves snapshots (`ServeSnapshots`, on by default)
+answers with the serialized document, addressed to the one that asked. That participant applies the first answer
+as a single batched change with origin `Remote`, so it does not land in their undo history, and ignores the rest:
+a later, slower answer could be older than strokes already received since. Everyone else ignores answers meant
+for someone else, so a participant joining never disturbs the ones already there.
+
+`SendSnapshotAsync` is different: it sends the document to everyone, and every participant replaces their copy
+with it. Use it to reset a session to one version, for example after restoring a saved document.
 
 Both sides must be editing the same document, including its layer ids. In practice a client joins by loading the
 snapshot, which gives it exactly that.

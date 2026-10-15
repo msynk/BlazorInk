@@ -21,14 +21,18 @@ namespace BlazorInk.Interop;
 internal static partial class WasmRenderBridge
 {
     private const string ModuleName = "blazorink";
-    private static bool s_initialized;
+    private static Task<bool>? s_initialization;
     private static bool s_available;
 
     /// <summary>Imports the module into the WebAssembly runtime. Returns false when the fast path is unavailable.</summary>
-    public static async Task<bool> TryInitializeAsync(string modulePath)
+    /// <remarks>
+    /// Every caller shares the one import. A flag set before awaiting it made a second canvas attaching while the
+    /// import was still in flight read "not available" and fall back to the slow path for the rest of its life.
+    /// </remarks>
+    public static Task<bool> TryInitializeAsync(string modulePath) => s_initialization ??= InitializeAsync(modulePath);
+
+    private static async Task<bool> InitializeAsync(string modulePath)
     {
-        if (s_initialized) return s_available;
-        s_initialized = true;
         if (!OperatingSystem.IsBrowser()) return false;
         try
         {

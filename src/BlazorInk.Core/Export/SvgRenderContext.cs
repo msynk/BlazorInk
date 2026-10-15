@@ -348,20 +348,7 @@ public sealed class SvgRenderContext : IRenderContext, IRenderContextCapabilitie
     /// <summary>Returns <c>#rrggbb</c>; alpha is emitted separately as an opacity attribute for maximum viewer compatibility.</summary>
     private static string RgbOnly(InkColor color) => (color with { A = 255 }).ToCss();
 
-    private void WriteNumber(float value, int decimals)
-    {
-        if (!float.IsFinite(value)) value = 0;
-        Span<char> buffer = stackalloc char[32];
-        value.TryFormat(buffer, out int written, "F" + decimals.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
-        ReadOnlySpan<char> s = buffer[..written];
-        if (s.IndexOf('.') >= 0)
-        {
-            s = s.TrimEnd('0');
-            if (s.Length > 0 && s[^1] == '.') s = s[..^1];
-        }
-        if (s.IsEmpty || s.SequenceEqual("-0")) s = "0";
-        _writer.Write(s);
-    }
+    private void WriteNumber(float value, int decimals) => SvgNumber.Write(_writer, value, decimals);
 }
 
 /// <summary>XML escaping helpers shared by the SVG writers.</summary>
@@ -370,8 +357,9 @@ internal static class SvgText
     /// <summary>Writes text with XML special characters escaped.</summary>
     public static void WriteEscaped(TextWriter writer, ReadOnlySpan<char> text)
     {
-        foreach (char c in text)
+        for (int i = 0; i < text.Length; i++)
         {
+            char c = text[i];
             switch (c)
             {
                 case '<': writer.Write("&lt;"); break;
@@ -382,6 +370,10 @@ internal static class SvgText
                 default:
                     // Control characters are not legal in XML 1.0 and would make the output unparseable.
                     if (c < 0x20 && c is not ('\t' or '\n' or '\r')) writer.Write(' ');
+                    // Neither are the noncharacters U+FFFE and U+FFFF, nor a surrogate that is not part of a pair.
+                    else if (c is '￾' or '￿') writer.Write(' ');
+                    else if (char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1])) { writer.Write(c); writer.Write(text[++i]); }
+                    else if (char.IsSurrogate(c)) writer.Write('�');
                     else writer.Write(c);
                     break;
             }

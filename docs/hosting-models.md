@@ -65,15 +65,20 @@ because there is no serialization boundary of consequence.
 ## When the browser layer cannot start
 
 If the JavaScript module cannot load, because a content security policy blocks it or static web assets are not
-served, the canvas stays inert instead of throwing and taking the page down. `InkCanvas.AttachFailed` carries the
-reason, so an application can tell the user something useful.
+served, the canvas stays inert instead of throwing and taking the page down. `Ready` is not raised; `Unavailable`
+is raised instead, with the reason, so an application can tell the user something useful. The same reason stays
+available afterwards as `InkCanvas.AttachFailed`, and the canvas reports it to screen readers itself.
 
 ```razor
-<InkCanvas @ref="_canvas" Ready="() => StateHasChanged()" />
+<InkCanvas Unavailable="reason => _unavailable = reason" />
 
-@if (_canvas?.AttachFailed is { } reason)
+@if (_unavailable is not null)
 {
-    <p role="alert">Drawing is unavailable: @reason</p>
+    <p role="alert">Drawing is unavailable: @_unavailable</p>
+}
+
+@code {
+    private string? _unavailable;
 }
 ```
 

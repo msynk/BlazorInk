@@ -77,6 +77,7 @@ internal interface IInkInteropClient
     void OnResized(double width, double height, double devicePixelRatio);
     void OnKey(string key, bool ctrl, bool shift, bool alt);
     void OnTextEditorKey(string key, string value);
+    void OnRedrawRequested();
 }
 
 /// <summary>
@@ -120,6 +121,9 @@ internal sealed class InkInterop : IAsyncDisposable
 
     /// <summary>True when the zero-copy WebAssembly rendering path is in use.</summary>
     public bool UsesFastPath => _useWasmFastPath;
+
+    /// <summary>True when the browser module loaded, so calls that need no surface (such as a download) can work.</summary>
+    public bool IsModuleLoaded => _module is not null && !_disposed;
 
     /// <summary>Loads the module, attaches to the element and returns the browser's capabilities.</summary>
     public async Task<AttachResult?> AttachAsync(ElementReference element, InteropOptions options, CancellationToken cancellationToken = default)
@@ -201,6 +205,9 @@ internal sealed class InkInterop : IAsyncDisposable
         return InvokeVoidAsync("execute", _id, layerName, context.CommandSegment.ToArray(), context.Count, strings);
     }
 
+    /// <summary>Updates the options given at attach, when the parameters behind them change.</summary>
+    public ValueTask SetOptionsAsync(InteropOptions options) => InvokeVoidAsync("setOptions", _id, options);
+
     /// <summary>Sets the cursor shown over the canvas.</summary>
     public ValueTask SetCursorAsync(string cursor) => InvokeVoidAsync("setCursor", _id, cursor);
 
@@ -217,6 +224,14 @@ internal sealed class InkInterop : IAsyncDisposable
             return await _module.InvokeAsync<ImageMetrics>("loadImage", cancellationToken, _id, uri).ConfigureAwait(false);
         }
         catch (JSException)
+        {
+            return null;
+        }
+        catch (JSDisconnectedException)
+        {
+            return null;
+        }
+        catch (ObjectDisposedException)
         {
             return null;
         }
@@ -347,5 +362,12 @@ internal sealed class InkInterop : IAsyncDisposable
         {
             if (!string.IsNullOrEmpty(key)) client.OnTextEditorKey(key, value ?? string.Empty);
         }
+
+        /// <summary>
+        /// Asks for both layers to be redrawn: an image the last frame referenced has finished decoding, or the
+        /// browser restored a canvas whose 2D context it had discarded.
+        /// </summary>
+        [JSInvokable]
+        public void OnRedrawRequested() => client.OnRedrawRequested();
     }
 }

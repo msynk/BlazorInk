@@ -103,7 +103,9 @@ public static class PngExporter
         {
             ClipBounds = region,
             IncludeHiddenLayers = options.IncludeHiddenLayers,
-            ElementFilter = options.SelectedIds,
+            // An empty selection filters nothing, as in SvgExporter; otherwise the two exporters disagree on the
+            // same options and the PNG comes out blank where the SVG has the whole drawing.
+            ElementFilter = options.SelectedIds is { Count: > 0 } ? options.SelectedIds : null,
         };
         DocumentRenderer.Render(document, context, renderOptions);
         return (surface, context);

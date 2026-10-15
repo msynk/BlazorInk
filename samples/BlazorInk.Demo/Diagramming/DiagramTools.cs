@@ -34,6 +34,9 @@ public sealed class NodeTool : ToolBase
     /// <summary>Smallest box a drag can produce, so a stray click still makes a usable node.</summary>
     public Vector2 MinimumSize { get; set; } = new(90, 48);
 
+    /// <summary>Supplies the label of each new node, or null for unlabelled nodes.</summary>
+    public Func<string?>? NextLabel { get; set; }
+
     /// <inheritdoc />
     public override bool OnPointerDown(IToolContext context, in InputSample sample)
     {
@@ -76,7 +79,7 @@ public sealed class NodeTool : ToolBase
 
         try
         {
-            context.Document.AddElement(DiagramGraph.CreateNode(box, context.ShapeStyle), context.ActiveLayerId);
+            context.Document.AddElement(DiagramGraph.CreateNode(box, context.ShapeStyle, NextLabel?.Invoke()), context.ActiveLayerId);
             context.Announce("Node added.");
         }
         catch (InvalidOperationException ex)
@@ -197,7 +200,15 @@ public sealed class ConnectorTool : ToolBase
         try
         {
             // The connector goes under the nodes so the boxes stay readable where a line meets them.
-            context.Document.AddElement(DiagramGraph.CreateConnector(from, target, context.ShapeStyle), context.ActiveLayerId);
+            LineShape connector = DiagramGraph.CreateConnector(from, target, context.ShapeStyle);
+            using (context.Document.BeginBatch("Connect nodes"))
+            {
+                context.Document.AddElement(connector, context.ActiveLayerId);
+                if (context.Document.GetLayerOf(connector.Id) is { } layer)
+                {
+                    context.Document.Apply(new Operations.ReorderElementOperation(connector.Id, layer.Id, 0));
+                }
+            }
             context.Announce("Nodes connected.");
         }
         catch (InvalidOperationException ex)

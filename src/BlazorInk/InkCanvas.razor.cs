@@ -80,6 +80,7 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     private bool _focusTextEditor;
     private bool _firstRenderDone;
     private (InkColor? Color, float Width, float Opacity)? _wetInkSent;
+    private InteropOptions? _optionsSent;
 
     /// <summary>Creates the component.</summary>
     public InkCanvas()
@@ -214,6 +215,14 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     [Parameter]
     public EventCallback<InputCapabilities> Ready { get; set; }
 
+    /// <summary>
+    /// Raised instead of <see cref="Ready"/> when the browser layer cannot start, for example because a content
+    /// security policy blocks its script, with the reason. The canvas stays inert; <see cref="AttachFailed"/>
+    /// holds the same reason afterwards.
+    /// </summary>
+    [Parameter]
+    public EventCallback<string> Unavailable { get; set; }
+
     // ---- Public API -------------------------------------------------------------------------------------------
 
     /// <summary>The document being edited.</summary>
@@ -285,6 +294,9 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     public void LoadDocument(InkDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        // Same as replacing the Document parameter: a gesture in flight refers to the old document's elements and
+        // history, and finishing it afterwards would commit it into the new document.
+        if (!ReferenceEquals(document, _document)) CancelActiveGesture();
         AttachDocument(document);
         InvalidateAll();
     }
@@ -344,7 +356,14 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     public async Task<byte[]> ExportPngAsync(PngExportOptions? options = null, CancellationToken cancellationToken = default)
     {
         options ??= PngExportOptions.Default;
-        if (_interop is null) return PngExporter.Export(_document, options);
+        // Without an attached surface the browser has nothing to render into: a failed or blocked attach would
+        // otherwise return an empty array, or throw from the module, instead of using the managed rasterizer.
+        if (_interop is null || !_attached)
+        {
+            return PngExporter.Export(_document, options.Region == ExportRegion.Selection && options.SelectedIds is null
+                ? options with { SelectedIds = _selection.Ids }
+                : options);
+        }
 
         Rect region = ResolveExportRegion(options);
         float scale = options.Scale > 0 ? options.Scale : 1f;
@@ -405,7 +424,9 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     /// </summary>
     private void RequireBrowser()
     {
-        if (_interop is null || _disposed)
+        // The interop object exists from the first render on, whether or not the module ever loaded, so its mere
+        // presence would let a blocked module turn every save into a silent no-op.
+        if (_interop is not { IsModuleLoaded: true } || _disposed)
         {
             throw new InvalidOperationException(
                 AttachFailed is { } reason
@@ -424,10 +445,12 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if (ReadOnly) return null;
 
         Rendering.ImageSource resolved = source;
-        if (_interop is not null && (source.Width == 0 || source.Height == 0))
+        if (_interop is not null)
         {
+            // Loaded even when the size is already known: the canvas can only draw an image the browser has
+            // decoded, and loading it first means it appears with the element rather than a frame later.
             ImageMetrics? metrics = await _interop.LoadImageAsync(source.Uri).ConfigureAwait(false);
-            if (metrics is not null) resolved = source.WithSize(metrics.Width, metrics.Height);
+            if (metrics is not null && (source.Width == 0 || source.Height == 0)) resolved = source.WithSize(metrics.Width, metrics.Height);
         }
 
         Vector2 topLeft = position ?? _viewport.ToDocument(ViewSize / 2f);
@@ -515,6 +538,43 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             }
         }
         if (_history.Limit != HistoryLimit) _history.Limit = HistoryLimit;
+
+        // The browser layer was configured from these parameters at attach and acts on them synchronously inside
+        // its own event handlers, so a change has to reach it too.
+        if (_attached)
+        {
+            _ = UpdateOptionsAsync();
+            _ = UpdateWetInkStyleAsync();
+        }
+    }
+
+    private InteropOptions BuildInteropOptions() => new()
+    {
+        RejectTouchWhilePen = RejectTouchWhilePen,
+        HandleKeyboard = EnableKeyboardShortcuts,
+        TrackHover = false,
+        WetInk = WetInk ?? !OperatingSystem.IsBrowser(),
+    };
+
+    private async Task UpdateOptionsAsync()
+    {
+        if (_interop is null || _disposed) return;
+        InteropOptions options = BuildInteropOptions();
+        if (options == _optionsSent) return;
+        _optionsSent = options;
+        try
+        {
+            await _interop.SetOptionsAsync(options).ConfigureAwait(false);
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+        catch (TaskCanceledException)
+        {
+        }
     }
 
     /// <inheritdoc />
@@ -547,13 +607,8 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         _interop = new InkInterop(JSRuntime, this, _elementId, Navigation.BaseUri);
         try
         {
-            var options = new InteropOptions
-            {
-                RejectTouchWhilePen = RejectTouchWhilePen,
-                HandleKeyboard = EnableKeyboardShortcuts,
-                TrackHover = false,
-                WetInk = WetInk ?? !OperatingSystem.IsBrowser(),
-            };
+            InteropOptions options = BuildInteropOptions();
+            _optionsSent = options;
             AttachResult? result = await _interop.AttachAsync(_container, options).ConfigureAwait(false);
             if (_disposed) return;
 
@@ -574,6 +629,8 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             await _interop.SetSizeAsync(_cssWidth, _cssHeight, _devicePixelRatio).ConfigureAwait(false);
             if (_disposed) return;
             await _interop.SetCursorAsync(_cursor).ConfigureAwait(false);
+            // Parameters that changed while the attach was in flight were not sent, because it had not finished.
+            await UpdateOptionsAsync().ConfigureAwait(false);
             await UpdateWetInkStyleAsync().ConfigureAwait(false);
             if (_disposed) return;
             InvalidateAll();
@@ -596,6 +653,29 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
             // The module failed to load or threw. Drawing is unavailable, but the application keeps running.
             AttachFailed = ex.Message;
             _capabilities = InputCapabilities.None;
+            await ReportUnavailableAsync(ex.Message).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Tells the application, and anyone using a screen reader, that drawing is unavailable. Ready is never raised
+    /// in this case, so without this an application waiting for it to show the reason would wait forever.
+    /// </summary>
+    private async Task ReportUnavailableAsync(string reason)
+    {
+        if (_disposed) return;
+        try
+        {
+            // Back on the renderer's dispatcher: the failure surfaces in a continuation that may not be on it.
+            await InvokeAsync(async () =>
+            {
+                StateHasChanged();
+                if (Unavailable.HasDelegate) await Unavailable.InvokeAsync(reason).ConfigureAwait(true);
+            }).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // The renderer went away first.
         }
     }
 
@@ -892,6 +972,14 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         _ = ResizeAsync();
     }
 
+    void IInkInteropClient.OnRedrawRequested()
+    {
+        if (_disposed) return;
+        // The browser decoded an image the last frame had to skip, or restored a discarded canvas context. The
+        // pixels are gone or incomplete but nothing in the model changed, so only a repaint is needed.
+        InvalidateAll();
+    }
+
     private async Task ResizeAsync()
     {
         if (_interop is null || _disposed) return;
@@ -986,6 +1074,9 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
         if (_activeTool is not TextTool tool) return;
         tool.EditRequested -= OnTextEditRequested;
         tool.EditFinished -= OnTextEditFinished;
+        // Unsubscribed before the tool is deactivated, so the EditFinished that would have closed the editor never
+        // arrives here. The markup has to be refreshed explicitly or the textarea stays on screen.
+        if (_textEditor is not null) _uiDirty = true;
         _textEditor = null;
     }
 
@@ -1268,6 +1359,8 @@ public sealed partial class InkCanvas : ComponentBase, IAsyncDisposable, IInkInt
     /// </summary>
     private string GetContentDescription()
     {
+        // A canvas that cannot draw is still focusable; saying why is the difference between broken and silent.
+        if (AttachFailed is { } reason) return "Drawing is unavailable: " + reason;
         if (_document is null) return string.Empty;
         if (_document.IsEmpty) return "Empty drawing canvas.";
 

@@ -12,14 +12,14 @@
 <div class="panel" style="padding:1rem">
     @* A host that reads canvas state (such as the undo button below) re-renders on this callback.
        Pointer input itself never re-renders anything. *@
-    <InkCanvas @ref="_canvas" Height="260px" EnableTouchGestures="true" Brush="_brush" AriaLabel="Try drawing here"
+    <InkCanvas @ref="_canvas" HistoryChanged="() => StateHasChanged()" Height="260px" EnableTouchGestures="true" Brush="_brush" AriaLabel="Try drawing here"
                DocumentChanged="() => StateHasChanged()" />
 </div>
 <div class="toolbar" style="border:1px solid var(--border);border-top:none;border-radius:0 0 10px 10px">
     <span class="field">Draw above with a mouse, a finger or a stylus.</span>
     <div class="toolbar-spacer"></div>
     <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)" @onclick="Undo">Undo</button>
-    <button type="button" class="btn danger" @onclick="Clear">Clear</button>
+    <button type="button" class="btn danger" disabled="@(_canvas is null || _canvas.CurrentDocument.IsEmpty)" @onclick="Clear">Clear</button>
 </div>
 
 <h2>What it is for</h2>
@@ -51,6 +51,18 @@
     <a class="card" href="collaboration">
         <h3>Collaboration</h3>
         <p>Two canvases synchronizing through operations, with live cursors and remote ink.</p>
+    </a>
+</div>
+
+<h2>Under the hood</h2>
+<div class="grid">
+    <a class="card" href="serialization">
+        <h3>Serialization</h3>
+        <p>Save, inspect, edit and reload the vector document, and see what each format costs in bytes.</p>
+    </a>
+    <a class="card" href="performance">
+        <h3>Performance</h3>
+        <p>Generate thousands of strokes and time geometry, redraw, hit testing, save, load and export.</p>
     </a>
 </div>
 

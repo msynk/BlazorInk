@@ -1,6 +1,7 @@
 using System.Numerics;
 using BlazorInk.Brushes;
 using BlazorInk.Geometry;
+using BlazorInk.Input;
 using BlazorInk.Tools;
 using Xunit;
 using Xunit.Abstractions;
@@ -108,5 +109,48 @@ public class EraserRegressionTests(ITestOutputHelper output)
         float gap = pieces[1].Bounds.Left - pieces[0].Bounds.Right;
         Assert.True(gap > 10f, $"the eraser left a gap of only {gap} units");
         Assert.True(pieces[0].Bounds.Left < 60f && pieces[1].Bounds.Right > 540f, "the ends of the line were lost");
+    }
+
+    [Fact]
+    public void A_second_pointer_after_a_mode_change_does_not_strand_the_gesture()
+    {
+        using var context = new TestToolContext();
+        context.Document.AddElement(new Stroke(TestData.Line(new Vector2(0, 100), new Vector2(400, 100), 40), new PenBrush { Width = 4f }));
+        context.History.Clear();
+        var eraser = new EraserTool { Mode = EraserMode.Stroke, Radius = 10f };
+
+        static InputSample S(int id, PointerPhase phase, float x, float y) => new()
+        {
+            PointerId = id, Kind = PointerKind.Touch, Phase = phase, X = x, Y = y, Pressure = 0.5f,
+            Buttons = phase == PointerPhase.Up ? 0 : 1, IsPrimary = id == 1,
+        };
+
+        Assert.True(eraser.OnPointerDown(context, S(1, PointerPhase.Down, 200, 100)));
+        eraser.Mode = EraserMode.Pixel;
+        // A second finger lands while the first is still erasing. Latching the new mode for it used to route the
+        // first finger's release to the pixel path, which ignored it and left the history group open.
+        Assert.False(eraser.OnPointerDown(context, S(2, PointerPhase.Down, 300, 300)));
+        eraser.OnPointerUp(context, S(1, PointerPhase.Up, 200, 100));
+
+        Assert.False(eraser.IsErasing);
+        Assert.False(eraser.IsDrawing);
+        Assert.Equal(0, context.Document.ElementCount);
+        Assert.True(context.History.Undo(), "the erase was not recorded, or history was left disabled");
+        Assert.Equal(1, context.Document.ElementCount);
+    }
+
+    [Fact]
+    public void The_segment_eraser_does_not_cut_pixel_eraser_masks()
+    {
+        // Cutting a mask brings back the ink it hides, which is the opposite of erasing.
+        using var context = new TestToolContext();
+        var mask = new Stroke(TestData.Line(new Vector2(100, 0), new Vector2(100, 200), 40), new PixelEraserBrush { Width = 20f });
+        context.Document.AddElement(mask);
+        var eraser = new EraserTool { Mode = EraserMode.Segment, Radius = 10f };
+
+        context.Line(eraser, new Vector2(50, 100), new Vector2(150, 100), 10);
+
+        Assert.Equal(1, context.Document.ElementCount);
+        Assert.Same(mask, context.Document.GetElement(mask.Id));
     }
 }

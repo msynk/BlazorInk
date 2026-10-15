@@ -222,6 +222,10 @@ public static class PngCodec
         };
         if (colorType == 3 && palette is null) throw new FormatException("The palette PNG has no palette chunk.");
 
+        // The pixel limit is the caller's choice, so the buffer sizes are checked in 64 bits: with a generous limit
+        // they would otherwise wrap and allocate a buffer that does not match the image.
+        if ((long)width * height * 4 > Array.MaxLength || ((long)width * channels + 1) * height > Array.MaxLength)
+            throw new FormatException($"The PNG is {width} by {height} pixels, which is too large to decode.");
         int stride = width * channels;
         byte[] raw = new byte[(stride + 1) * height];
         idat.Position = 0;

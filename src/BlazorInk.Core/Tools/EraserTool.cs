@@ -78,11 +78,13 @@ public sealed class EraserTool : DrawTool
     {
         ArgumentNullException.ThrowIfNull(context);
         // The mode is fixed for the whole gesture: switching it half way through would route the release to a
-        // different code path and leave the history group open, which would disable undo.
+        // different code path and leave the history group open, which would disable undo. That includes a second
+        // pointer landing while a gesture is running: latching the mode for it would re-route the first pointer's
+        // release, so it is refused before the mode is read.
+        if (_erasing || IsDrawing) return false;
         _activeMode = Mode;
         if (_activeMode == EraserMode.Pixel) return base.OnPointerDown(context, sample);
 
-        if (_erasing) return false;
         _erasing = true;
         _pointerId = sample.PointerId;
         _path.Clear();
@@ -177,6 +179,9 @@ public sealed class EraserTool : DrawTool
 
                 if (element is Stroke stroke && _activeMode == EraserMode.Segment)
                 {
+                    // A pixel-eraser stroke is a mask, not ink. Cutting it would bring back the ink it hides, the
+                    // opposite of erasing; the stroke eraser leaves masks alone for the same reason.
+                    if (stroke.IsEraser) continue;
                     if (!StrokeEditor.EraseSegments(stroke, segment, Radius, _fragments)) continue;
                     if (_fragments.Count == 0)
                     {

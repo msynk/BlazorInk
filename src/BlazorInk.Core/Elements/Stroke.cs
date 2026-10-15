@@ -107,21 +107,27 @@ public sealed record Stroke : InkElement
     {
         if (!Bounds.Intersects(rect)) return false;
         if (rect.Contains(Bounds)) return true;
-        Rect local = rect;
-        if (!Transform.IsIdentity)
-        {
-            if (!Matrix3x2.Invert(Transform, out Matrix3x2 inverse)) return false;
-            local = rect.Transform(inverse);
-        }
-        float pad = Brush.HitTestWidth / 2f;
-        Rect padded = local.Inflate(pad);
+
+        // Test in document space. Mapping the rectangle into local space instead and taking its bounding box
+        // would, under rotation, cover far more than the rectangle and select strokes it does not touch.
+        Matrix3x2 transform = Transform;
+        bool identity = transform.IsIdentity;
+        float scale = identity ? 1f : MathF.Sqrt(MathF.Abs(transform.GetDeterminant()));
+        if (!float.IsFinite(scale) || scale < GeometryMath.Epsilon) scale = 1f;
+        Rect padded = rect.Inflate(Brush.HitTestWidth / 2f * scale);
         int n = Points.Count;
         ReadOnlySpan<float> xs = Points.X;
         ReadOnlySpan<float> ys = Points.Y;
-        if (n == 1) return padded.Contains(new Vector2(xs[0], ys[0]));
+        if (n == 0) return false;
+        Vector2 previous = new(xs[0], ys[0]);
+        if (!identity) previous = Vector2.Transform(previous, transform);
+        if (n == 1) return padded.Contains(previous);
         for (int i = 1; i < n; i++)
         {
-            if (GeometryMath.SegmentIntersectsRect(new Vector2(xs[i - 1], ys[i - 1]), new Vector2(xs[i], ys[i]), padded)) return true;
+            Vector2 next = new(xs[i], ys[i]);
+            if (!identity) next = Vector2.Transform(next, transform);
+            if (GeometryMath.SegmentIntersectsRect(previous, next, padded)) return true;
+            previous = next;
         }
         return false;
     }

@@ -33,8 +33,15 @@ public sealed class LoopbackHub
 }
 
 /// <summary>One endpoint of a <see cref="LoopbackHub"/>.</summary>
+/// <remarks>
+/// While an endpoint is offline the hub keeps the operations sent to it, the way a relay server keeps a mailbox,
+/// and delivers them when it reconnects. Without that, whatever the others drew in the meantime would never
+/// arrive and the two documents would quietly drift apart. Presence is not kept: a cursor position from a
+/// minute ago is noise, not news.
+/// </remarks>
 public sealed class LoopbackTransport(LoopbackHub hub) : ICollaborationTransport
 {
+    private readonly Queue<CollaborationMessage> _inbox = new();
     private bool _connected = true;
 
     /// <inheritdoc />
@@ -53,12 +60,24 @@ public sealed class LoopbackTransport(LoopbackHub hub) : ICollaborationTransport
     public long SentBytes { get; private set; }
 
     /// <summary>Simulates going offline and coming back, to show the queue and reconnect behaviour.</summary>
-    public void SetConnected(bool connected)
+    public async Task SetConnectedAsync(bool connected)
     {
         if (_connected == connected) return;
         _connected = connected;
+        if (connected)
+        {
+            // Catch up on what arrived while offline before sending our own queue, as a client reconnecting to
+            // a server would.
+            while (_inbox.TryDequeue(out CollaborationMessage? message))
+            {
+                if (MessageReceived is not null) await MessageReceived(message).ConfigureAwait(false);
+            }
+        }
         ConnectionChanged?.Invoke(connected);
     }
+
+    /// <summary>Number of messages waiting for this endpoint to come back online.</summary>
+    public int InboxCount => _inbox.Count;
 
     /// <inheritdoc />
     public async Task SendAsync(CollaborationMessage message, CancellationToken cancellationToken = default)
@@ -71,5 +90,12 @@ public sealed class LoopbackTransport(LoopbackHub hub) : ICollaborationTransport
     }
 
     internal Task ReceiveAsync(CollaborationMessage message)
-        => _connected && MessageReceived is not null ? MessageReceived(message) : Task.CompletedTask;
+    {
+        if (!_connected)
+        {
+            if (message.Kind != CollaborationMessageKind.Presence) _inbox.Enqueue(message);
+            return Task.CompletedTask;
+        }
+        return MessageReceived is not null ? MessageReceived(message) : Task.CompletedTask;
+    }
 }

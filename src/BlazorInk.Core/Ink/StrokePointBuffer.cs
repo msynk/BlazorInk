@@ -119,8 +119,18 @@ public sealed class StrokePointBuffer
         _y[i] = point.Y;
         _pressure[i] = point.Pressure;
         _time[i] = point.Time;
-        if (_tiltX is not null) { _tiltX[i] = point.TiltX; _tiltY![i] = point.TiltY; }
-        if (_twist is not null) _twist[i] = point.Twist;
+        // Same rule as Add: the first non-zero value allocates the channel, so a refined sample keeps its tilt.
+        if (point.TiltX != 0 || point.TiltY != 0 || _tiltX is not null)
+        {
+            EnsureTilt();
+            _tiltX![i] = point.TiltX;
+            _tiltY![i] = point.TiltY;
+        }
+        if (point.Twist != 0 || _twist is not null)
+        {
+            EnsureTwist();
+            _twist![i] = point.Twist;
+        }
         // Bounds may now be slightly too large; that is acceptable (conservative) for a live stroke.
         if (point.X < _minX) _minX = point.X;
         if (point.X > _maxX) _maxX = point.X;

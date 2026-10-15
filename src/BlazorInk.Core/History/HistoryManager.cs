@@ -28,6 +28,7 @@ public sealed class HistoryManager : IDisposable
     private bool _disposed;
     private int _limit;
     private List<HistoryEntry>? _consequences;
+    private HistoryEntry? _cause;
 
     /// <summary>Creates a manager and starts recording the document's changes.</summary>
     public HistoryManager(InkDocument document, int limit = 200)
@@ -206,6 +207,8 @@ public sealed class HistoryManager : IDisposable
             return;
         }
         Record(entry);
+        // Remembered so its consequences can join it when they are recorded, once the notification is over.
+        if (_groupDepth == 0) _cause = entry;
     }
 
     private void Record(HistoryEntry entry)
@@ -220,11 +223,23 @@ public sealed class HistoryManager : IDisposable
 
     private void OnDispatchCompleted()
     {
+        HistoryEntry? cause = _cause;
+        _cause = null;
         if (_consequences is not { Count: > 0 }) return;
         List<HistoryEntry> pending = _consequences;
         _consequences = null;
-        // Several consequential edits made during one notification undo as one step with their cause when a
-        // group is open, and as one step of their own when there is none.
+
+        // Consequences undo with their cause, or undoing once would revert the derived edit and leave the change
+        // that caused it in place: a node back on its old connectors' route, but still at its new position. With
+        // a group open the group already joins them. Without one, the cause is the step just pushed, and the
+        // consequences are folded into it.
+        if (_groupDepth == 0 && cause is not null && _undo.Count > 0 && ReferenceEquals(_undo[^1], cause))
+        {
+            _undo[^1] = Merge([cause, .. pending], cause.Label);
+            Changed?.Invoke(this, EventArgs.Empty);
+            return;
+        }
+        // A consequence of a change history did not record, such as a remote edit, is a step of its own.
         Record(pending.Count == 1 ? pending[0] : Merge(pending, pending[0].Label));
     }
 

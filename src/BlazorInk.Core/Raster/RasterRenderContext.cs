@@ -130,7 +130,9 @@ public sealed class RasterRenderContext : IRenderContext, IRenderContextCapabili
             for (int i = 0; i < source.Length; i++) dash[i] = MathF.Max(source[i] * scale, 0.05f);
         }
 
-        PathStroker.Stroke(device, width, paint.Cap, paint.Join, Tolerance, dash, _strokePolygons);
+        // Only the clip can be seen, so a dash pattern is only cut there: a huge shape with a tiny dash would
+        // otherwise be cut into an unbounded number of pieces.
+        PathStroker.Stroke(device, width, paint.Cap, paint.Join, Tolerance, dash, _strokePolygons, _state.Clip);
         if (_strokePolygons.Count == 0) return;
 
         _rasterizer.Reset();

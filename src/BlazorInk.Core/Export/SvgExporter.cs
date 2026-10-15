@@ -367,9 +367,12 @@ public static class SvgExporter
     {
         Brushes.StrokeGeometry geometry = eraser.Geometry;
         if (geometry.IsEmpty) return;
-        var black = new InkColor(0, 0, 0);
-        if (geometry.Mode == Brushes.StrokeGeometryMode.Fill) context.FillPath(geometry.Path, new FillPaint(black));
-        else context.StrokePath(geometry.Path, new StrokePaint(black, geometry.LineWidth, 1f, BlendMode.Normal, geometry.Cap, geometry.Join));
+        // Over the white mask background, black at the eraser's alpha leaves 1 - alpha of the content: the same
+        // partial erase the canvas and the rasterizer apply for a translucent eraser.
+        var black = new InkColor(0, 0, 0, eraser.Brush.Color.A);
+        float opacity = eraser.Brush.Opacity;
+        if (geometry.Mode == Brushes.StrokeGeometryMode.Fill) context.FillPath(geometry.Path, new FillPaint(black, opacity));
+        else context.StrokePath(geometry.Path, new StrokePaint(black, geometry.LineWidth, opacity, BlendMode.Normal, geometry.Cap, geometry.Join));
     }
 
     private static void WriteElement(TextWriter writer, SvgRenderContext context, InkElement element, ExportState state)
@@ -400,18 +403,5 @@ public static class SvgExporter
         return result;
     }
 
-    private static void WriteNumber(TextWriter writer, float value, int decimals)
-    {
-        if (!float.IsFinite(value)) value = 0;
-        Span<char> buffer = stackalloc char[32];
-        value.TryFormat(buffer, out int written, "F" + decimals.ToString(CultureInfo.InvariantCulture), CultureInfo.InvariantCulture);
-        ReadOnlySpan<char> s = buffer[..written];
-        if (s.IndexOf('.') >= 0)
-        {
-            s = s.TrimEnd('0');
-            if (s.Length > 0 && s[^1] == '.') s = s[..^1];
-        }
-        if (s.IsEmpty || s.SequenceEqual("-0")) s = "0";
-        writer.Write(s);
-    }
+    private static void WriteNumber(TextWriter writer, float value, int decimals) => SvgNumber.Write(writer, value, decimals);
 }

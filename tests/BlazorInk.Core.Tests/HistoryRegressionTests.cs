@@ -180,4 +180,118 @@ public class HistoryRegressionTests(ITestOutputHelper output)
         Assert.Equal(0, document.ElementCount);
         Assert.Equal(300, before);
     }
+
+    [Fact]
+    public void Redo_into_a_layer_a_collaborator_removed_is_refused_not_thrown()
+    {
+        // The missing layer used to surface as KeyNotFoundException, which the history manager does not catch:
+        // the redo crashed instead of being refused like any other step the document moved past.
+        var document = new InkDocument();
+        using var history = new HistoryManager(document);
+        Layer notes = document.AddLayer("Notes");
+        document.AddElement(TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10)), notes.Id);
+        Assert.True(history.Undo());
+
+        document.Apply(new Operations.RemoveLayerOperation(notes.Id), ChangeOrigin.Remote);
+
+        Assert.False(history.Redo());
+        Assert.Equal(1, history.RedoCount);
+    }
+
+    [Fact]
+    public void A_tool_working_on_a_layer_that_no_longer_exists_does_not_strand_history()
+    {
+        using var context = new TestToolContext();
+        context.ActiveLayerId = Guid.NewGuid();
+
+        // The pen reports the refusal instead of throwing out of the pointer callback.
+        context.Line(new DrawTool(), new Vector2(10, 10), new Vector2(100, 60));
+        Assert.Equal(0, context.Document.ElementCount);
+
+        // The text tool opens its undo group before adding the box; a throw there used to leave it open for good.
+        Assert.False(new TextTool().CreateAt(context, new Vector2(20, 20)));
+
+        context.ActiveLayerId = context.Document.Layers[0].Id;
+        context.Line(new DrawTool(), new Vector2(10, 10), new Vector2(100, 60));
+        Assert.True(context.History.Undo(), "history was left disabled by the refused text box");
+    }
+
+    [Fact]
+    public void A_text_box_left_blank_leaves_no_undo_step()
+    {
+        using var context = new TestToolContext();
+        var tool = new TextTool();
+        Assert.True(tool.CreateAt(context, new Vector2(20, 20)));
+        tool.CommitEdit(context, "   ");
+
+        Assert.Equal(0, context.Document.ElementCount);
+        Assert.False(context.History.CanUndo, "an undo step that adds and removes the same empty box does nothing");
+    }
+
+    [Fact]
+    public void A_failed_batch_puts_elements_back_at_their_original_version()
+    {
+        // The rollback is never reported to collaborators, so a version bump here would leave this replica ahead
+        // of everyone else and make it discard their next edit of the element.
+        var document = new InkDocument();
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10));
+        document.AddElement(stroke);
+        InkElement before = document.GetElement(stroke.Id);
+
+        var batch = new Operations.BatchOperation(
+        [
+            new Operations.ReplaceElementOperation(before with { Description = "edited" }),
+            new Operations.RemoveElementOperation(Guid.NewGuid()),
+        ]);
+        Assert.Throws<InvalidOperationException>(() => document.Apply(batch));
+
+        InkElement after = document.GetElement(stroke.Id);
+        Assert.Null(after.Description);
+        Assert.Equal(before.Version, after.Version);
+    }
+
+    [Fact]
+    public void Redoing_a_drag_reports_the_versions_it_stores()
+    {
+        // Redo replays every frame of the drag in one batch. Each frame was reported with the version the document
+        // had before the batch, while the document stored a higher one per frame, so what collaborators received
+        // did not match what the sender kept.
+        var document = new InkDocument();
+        using var history = new HistoryManager(document);
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10));
+        document.AddElement(stroke);
+        using (history.BeginGroup("Move"))
+        {
+            for (int i = 1; i <= 3; i++) document.ReplaceElement(document.GetElement(stroke.Id) with { Transform = Matrix3x2.CreateTranslation(i * 10, 0) });
+        }
+        Assert.True(history.Undo());
+
+        Operations.DrawingOperation? reported = null;
+        document.Changed += (_, e) => reported = e.Operation;
+        Assert.True(history.Redo());
+
+        var versions = new List<int>();
+        void Collect(Operations.DrawingOperation operation)
+        {
+            if (operation is Operations.ReplaceElementOperation replace) versions.Add(replace.Element.Version);
+            else if (operation is Operations.BatchOperation batch) foreach (Operations.DrawingOperation inner in batch.Operations) Collect(inner);
+        }
+        Collect(reported!);
+
+        Assert.Equal(3, versions.Count);
+        Assert.Equal(versions.Distinct().Count(), versions.Count);
+        Assert.Equal(document.GetElement(stroke.Id).Version, versions[^1]);
+    }
+
+    [Fact]
+    public void An_element_at_the_highest_version_does_not_wrap_to_a_negative_one()
+    {
+        var document = new InkDocument();
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10)) with { Version = int.MaxValue };
+        document.AddElement(stroke);
+
+        document.ReplaceElement(document.GetElement(stroke.Id) with { Description = "edited" });
+
+        Assert.Equal(int.MaxValue, document.GetElement(stroke.Id).Version);
+    }
 }

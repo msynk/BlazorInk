@@ -129,25 +129,55 @@ public class DerivedGeometryTests
     }
 
     [Fact]
-    public void An_ungrouped_consequence_is_recorded_after_its_cause_rather_than_before_it()
+    public void An_ungrouped_consequence_joins_the_step_that_caused_it()
     {
         (InkDocument document, Guid nodeId, Guid connectorId) = BuildGraph();
         using var history = new HistoryManager(document);
         using var graph = new Connector(document, nodeId, connectorId);
+        Vector2 connectorBefore = ((LineShape)document.GetElement(connectorId)).End;
 
+        // An edit made through the API rather than a tool has no group around it. Its consequence must still undo
+        // with it: as a step of its own, undoing once would put the connector back and leave the node where it
+        // was moved, a state the user never saw. Which order the handlers were subscribed in must not matter.
         var node = (RectangleShape)document.GetElement(nodeId);
         document.ReplaceElement(node.Translate(new Vector2(150, 90)));
 
-        // Without a group the consequence is a step of its own, but it must be the later one: undoing once has to
-        // take the connector back before the node, or the connector would be re-routed to where the node no
-        // longer is. Which order the handlers were subscribed in must not decide this.
-        Assert.Equal(2, history.UndoCount);
-        Vector2 movedNode = document.GetElement(nodeId).Bounds.Center;
+        Assert.Equal(1, graph.Reroutes);
+        Assert.Equal(1, history.UndoCount);
 
         Assert.True(history.Undo());
-        Assert.Equal(movedNode.X, document.GetElement(nodeId).Bounds.Center.X, 3);
-        Assert.True(history.Undo());
         Assert.Equal(200 + 40, document.GetElement(nodeId).Bounds.Center.X, 3);
+        Assert.Equal(connectorBefore.X, ((LineShape)document.GetElement(connectorId)).End.X, 3);
+        Assert.Equal(connectorBefore.Y, ((LineShape)document.GetElement(connectorId)).End.Y, 3);
+        Assert.False(history.CanUndo);
+
+        // Redo replays the cause and its consequence together.
+        Assert.True(history.Redo());
+        Assert.Equal(1, history.UndoCount);
+    }
+
+    [Fact]
+    public void A_consequence_of_a_change_history_did_not_record_is_a_step_of_its_own()
+    {
+        (InkDocument document, Guid nodeId, _) = BuildGraph();
+        using var history = new HistoryManager(document);
+        var marker = new RectangleShape(new Rect(0, 0, 10, 10));
+        document.AddElement(marker);
+        int steps = history.UndoCount;
+
+        // A listener that reacts locally to a remote edit. The remote edit is not undoable here, but the local
+        // edit it caused is, and it must not be folded into whatever local step happened to be recorded last.
+        document.Changed += (_, e) =>
+        {
+            if (e.Origin == ChangeOrigin.Remote && e.Depth == 0) document.RemoveElement(marker.Id);
+        };
+        var node = (RectangleShape)document.GetElement(nodeId);
+        document.Apply(new ReplaceElementOperation(node.Translate(new Vector2(150, 90))), ChangeOrigin.Remote);
+
+        Assert.Equal(steps + 1, history.UndoCount);
+        Assert.True(history.Undo());
+        Assert.True(document.ContainsElement(marker.Id));
+        Assert.Equal(steps, history.UndoCount);
     }
 
     [Fact]

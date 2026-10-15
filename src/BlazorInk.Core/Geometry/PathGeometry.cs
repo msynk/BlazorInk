@@ -95,6 +95,8 @@ public sealed class PathGeometry
         int c = 0;
         Vector2 current = default;
         bool closed = false;
+        // True while the only point held is the implicit start a Close leaves behind for a following LineTo.
+        bool implicitStart = false;
 
         void Emit()
         {
@@ -108,18 +110,24 @@ public sealed class PathGeometry
             switch (verb)
             {
                 case PathVerb.MoveTo:
+                    // The point a Close left behind is not a sub-path of its own: emitting it would make a stroker
+                    // draw a cap dot at the start of every closed sub-path that is followed by another one.
+                    if (implicitStart) points.Clear();
+                    implicitStart = false;
                     Emit();
                     current = new Vector2(_coords[c], _coords[c + 1]);
                     c += 2;
                     points.Add(current);
                     break;
                 case PathVerb.LineTo:
+                    implicitStart = false;
                     current = new Vector2(_coords[c], _coords[c + 1]);
                     c += 2;
                     points.Add(current);
                     break;
                 case PathVerb.QuadTo:
                 {
+                    implicitStart = false;
                     var p1 = new Vector2(_coords[c], _coords[c + 1]);
                     var p2 = new Vector2(_coords[c + 2], _coords[c + 3]);
                     c += 4;
@@ -129,6 +137,7 @@ public sealed class PathGeometry
                 }
                 case PathVerb.CubicTo:
                 {
+                    implicitStart = false;
                     var p1 = new Vector2(_coords[c], _coords[c + 1]);
                     var p2 = new Vector2(_coords[c + 2], _coords[c + 3]);
                     var p3 = new Vector2(_coords[c + 4], _coords[c + 5]);
@@ -146,6 +155,7 @@ public sealed class PathGeometry
                         current = start;
                         // A subsequent LineTo without MoveTo continues from the sub-path start.
                         points.Add(start);
+                        implicitStart = true;
                     }
                     break;
             }
@@ -203,8 +213,8 @@ public sealed class PathGeometry
     public void WriteSvgPathData(TextWriter writer, int decimals = 2)
     {
         int c = 0;
-        string format = "F" + Math.Clamp(decimals, 0, 6).ToString(System.Globalization.CultureInfo.InvariantCulture);
-        Span<char> buffer = stackalloc char[32];
+        decimals = Math.Clamp(decimals, 0, 6);
+        Span<char> buffer = stackalloc char[SvgNumber.MaxLength];
         bool first = true;
         foreach (PathVerb verb in _verbs)
         {
@@ -212,34 +222,22 @@ public sealed class PathGeometry
             first = false;
             switch (verb)
             {
-                case PathVerb.MoveTo: writer.Write('M'); WriteCoords(writer, buffer, format, ref c, 2); break;
-                case PathVerb.LineTo: writer.Write('L'); WriteCoords(writer, buffer, format, ref c, 2); break;
-                case PathVerb.QuadTo: writer.Write('Q'); WriteCoords(writer, buffer, format, ref c, 4); break;
-                case PathVerb.CubicTo: writer.Write('C'); WriteCoords(writer, buffer, format, ref c, 6); break;
+                case PathVerb.MoveTo: writer.Write('M'); WriteCoords(writer, buffer, decimals, ref c, 2); break;
+                case PathVerb.LineTo: writer.Write('L'); WriteCoords(writer, buffer, decimals, ref c, 2); break;
+                case PathVerb.QuadTo: writer.Write('Q'); WriteCoords(writer, buffer, decimals, ref c, 4); break;
+                case PathVerb.CubicTo: writer.Write('C'); WriteCoords(writer, buffer, decimals, ref c, 6); break;
                 case PathVerb.Close: writer.Write('Z'); break;
             }
         }
     }
 
-    private void WriteCoords(TextWriter writer, Span<char> buffer, string format, ref int c, int count)
+    private void WriteCoords(TextWriter writer, Span<char> buffer, int decimals, ref int c, int count)
     {
         for (int i = 0; i < count; i++)
         {
             if (i > 0) writer.Write(i % 2 == 0 ? ' ' : ',');
-            float v = _coords[c++];
-            if (!float.IsFinite(v)) v = 0;
-            v.TryFormat(buffer, out int written, format, System.Globalization.CultureInfo.InvariantCulture);
-            writer.Write(TrimZeros(buffer[..written]));
+            writer.Write(buffer[..SvgNumber.Format(_coords[c++], decimals, buffer)]);
         }
-    }
-
-    private static ReadOnlySpan<char> TrimZeros(ReadOnlySpan<char> s)
-    {
-        if (s.IndexOf('.') < 0) return s;
-        s = s.TrimEnd('0');
-        if (s.Length > 0 && s[^1] == '.') s = s[..^1];
-        if (s.SequenceEqual("-0")) return "0";
-        return s.IsEmpty ? "0" : s;
     }
 
     /// <summary>Returns the path in SVG path-data syntax.</summary>

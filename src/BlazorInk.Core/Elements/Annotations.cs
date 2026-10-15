@@ -66,12 +66,12 @@ public sealed record CalloutElement : InkElement
     /// <param name="text">Text content.</param>
     public CalloutElement(Rect box, Vector2 anchor, string text)
     {
-        ArgumentNullException.ThrowIfNull(text);
-        if (text.Length > TextElement.MaxLength) throw new ArgumentException("Text is too long.", nameof(text));
         Box = box.Normalize();
         Anchor = anchor;
         Text = text;
     }
+
+    private readonly string _text = string.Empty;
 
     /// <summary>Text box rectangle.</summary>
     public Rect Box { get; init; }
@@ -80,7 +80,17 @@ public sealed record CalloutElement : InkElement
     public Vector2 Anchor { get; init; }
 
     /// <summary>Text content.</summary>
-    public string Text { get; init; }
+    /// <remarks>Validated on every assignment, including <c>with</c> expressions, as <see cref="TextElement.Text"/> is.</remarks>
+    public string Text
+    {
+        get => _text;
+        init
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            if (value.Length > TextElement.MaxLength) throw new ArgumentException("Text is too long.", nameof(value));
+            _text = value;
+        }
+    }
 
     /// <summary>Text style.</summary>
     public TextStyle TextStyle { get; init; } = TextStyle.Default with { FontSize = 14f };

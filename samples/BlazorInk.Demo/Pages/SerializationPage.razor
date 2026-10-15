@@ -2,6 +2,7 @@
 @using BlazorInk.Export
 @using BlazorInk.Serialization
 @using System.Numerics
+@inject FileDownloads Downloads
 
 <PageTitle>Serialization</PageTitle>
 
@@ -17,10 +18,10 @@
         <div class="toolbar">
             <span class="field">Draw something, then save it.</span>
             <div class="toolbar-spacer"></div>
-            <button type="button" class="btn" @onclick="() => _canvas?.Undo()">Undo</button>
-            <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+            <button type="button" class="btn" disabled="@(_canvas is not { History.CanUndo: true })" @onclick="() => _canvas?.Undo()">Undo</button>
+            <button type="button" class="btn danger" disabled="@(_canvas is null || _canvas.CurrentDocument.IsEmpty)" @onclick="() => _canvas?.Clear()">Clear</button>
         </div>
-        <InkCanvas @ref="_canvas" Height="340px" Brush="_brush" AriaLabel="Source drawing"
+        <InkCanvas @ref="_canvas" HistoryChanged="() => StateHasChanged()" Height="340px" Brush="_brush" AriaLabel="Source drawing"
                    DocumentChanged="() => StateHasChanged()"
                    Ready="() => StateHasChanged()" />
         <CanvasStatus Canvas="_canvas" />
@@ -30,6 +31,11 @@
         <div class="toolbar">
             <button type="button" class="btn primary" @onclick="Save">Save</button>
             <button type="button" class="btn" disabled="@(_saved is null)" @onclick="Load">Load into the canvas</button>
+            <button type="button" class="btn" disabled="@(_saved is null)" @onclick="DownloadAsync">Download</button>
+            <label class="btn">
+                Open file
+                <InputFile OnChange="OpenAsync" accept=".json,.blazorink,application/json" style="display:none" />
+            </label>
             <div class="toolbar-spacer"></div>
             <label class="field">
                 <input type="checkbox" checked="@_readable" @onchange="OnReadableChanged" />
@@ -62,10 +68,21 @@
     </div>
 </div>
 
+@if (_error is not null)
+{
+    <p role="alert" style="color:var(--danger)">@_error</p>
+}
+
 @if (_saved is not null)
 {
     <h2>Stored document</h2>
-    <pre class="output"><code>@_saved</code></pre>
+    <p class="page-intro">
+        This is the text that was saved, and you can edit it. Change a number and load it to see the edit take
+        effect, or break the JSON to see the loader refuse it with a reason instead of loading half a drawing.
+    </p>
+    <textarea class="output" aria-label="Stored document" spellcheck="false" rows="14"
+              style="width:100%;font-family:ui-monospace,monospace;font-size:0.8rem"
+              value="@_saved" @onchange="e => _saved = e.Value?.ToString()"></textarea>
 }
 
 <div class="note">
@@ -79,21 +96,29 @@
 
     private InkCanvas? _canvas;
     private readonly Brush _brush = new PenBrush { Width = 4f, Color = InkColor.Parse("#111827") };
+    private InkDocument? _snapshot;
     private string? _saved;
+    private string? _error;
     private bool _readable;
     private Stats? _stats;
 
     private void OnReadableChanged(ChangeEventArgs e)
     {
         _readable = e.Value is true;
-        if (_saved is not null) Save();
+        // Re-show what was saved in the other format. The drawing may have changed since; that is not saved yet.
+        if (_snapshot is not null) Show(_snapshot);
     }
 
     private void Save()
     {
         if (_canvas is null) return;
-        InkDocument document = _canvas.CurrentDocument;
+        _error = null;
+        _snapshot = _canvas.CurrentDocument.Clone();
+        Show(_snapshot);
+    }
 
+    private void Show(InkDocument document)
+    {
         string compact = InkSerializer.Serialize(document);
         string readable = InkSerializer.Serialize(document, InkSerializerOptions.Readable);
         _saved = _readable ? readable : compact;
@@ -116,11 +141,36 @@
         if (_canvas is null || _saved is null) return;
         if (InkSerializer.TryDeserialize(_saved, out InkDocument? document, out string? error) && document is not null)
         {
+            _error = null;
             _canvas.LoadDocument(document);
+            _snapshot = document.Clone();
         }
         else
         {
-            _saved = "Could not load: " + error;
+            // The text stays as it is, so the mistake can be found and fixed.
+            _error = "Could not load: " + error;
+        }
+    }
+
+    private async Task DownloadAsync()
+    {
+        if (_saved is null) return;
+        await Downloads.SaveAsync("drawing.blazorink.json", System.Text.Encoding.UTF8.GetBytes(_saved), "application/json");
+    }
+
+    private async Task OpenAsync(InputFileChangeEventArgs args)
+    {
+        const long maxBytes = 20 * 1024 * 1024;
+        try
+        {
+            using var reader = new StreamReader(args.File.OpenReadStream(maxBytes));
+            _saved = await reader.ReadToEndAsync();
+            _error = null;
+            Load();
+        }
+        catch (IOException ex)
+        {
+            _error = "That file could not be read: " + ex.Message;
         }
     }
 

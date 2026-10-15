@@ -40,6 +40,13 @@ public sealed record CollaborationMessage
     /// <summary>The document the message applies to.</summary>
     public Guid DocumentId { get; init; }
 
+    /// <summary>
+    /// The participant the message is for, or null when it is for everyone. A transport may use it to deliver the
+    /// message to that participant alone; a session ignores messages addressed to someone else, so a transport
+    /// that broadcasts everything is still correct.
+    /// </summary>
+    public string? RecipientId { get; init; }
+
     /// <summary>The serialized operation, for <see cref="CollaborationMessageKind.Operation"/>.</summary>
     public string? Operation { get; init; }
 

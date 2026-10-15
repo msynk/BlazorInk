@@ -9,8 +9,9 @@
 <h1>Collaboration</h1>
 <p class="page-intro">
     Two independent canvases with two independent documents, synchronized by exchanging operations. Draw on
-    either side and the stroke appears on the other. This runs entirely in the browser over an in-memory
-    transport; a real application implements the same interface over SignalR or WebSockets.
+    either side and the stroke appears on the other, with the other person's cursor and their stroke in progress
+    shown live. This runs entirely in the browser over an in-memory transport; a real application implements the
+    same interface over SignalR or WebSockets.
 </p>
 
 <div class="toolbar panel" style="border-radius:10px 10px 0 0;border-bottom:none">
@@ -21,16 +22,17 @@
         <span style="min-width:6ch">@_latency ms</span>
     </label>
     <div class="toolbar-separator"></div>
-    <label class="field">
-        <input type="checkbox" checked="@_leftOnline" @onchange="e => SetOnline(0, e.Value is true)" />
-        Alex online
-    </label>
-    <label class="field">
-        <input type="checkbox" checked="@_rightOnline" @onchange="e => SetOnline(1, e.Value is true)" />
-        Sam online
-    </label>
+    @for (int index = 0; index < 2; index++)
+    {
+        int i = index;
+        <label class="field">
+            <input type="checkbox" checked="@_online[i]" @onchange="e => SetOnlineAsync(i, e.Value is true)" />
+            @Participants[i].Name online
+        </label>
+    }
     <div class="toolbar-spacer"></div>
     <span class="field">Queued while offline: <strong>@(_sessions[0]?.PendingCount ?? 0)</strong> / <strong>@(_sessions[1]?.PendingCount ?? 0)</strong></span>
+    <span class="badge @(Converged ? "on" : null)" role="status">@(Converged ? "replicas identical" : "replicas differ")</span>
 </div>
 
 <div class="split" style="gap:1rem">
@@ -41,29 +43,35 @@
             <div class="toolbar">
                 <strong style="color:@Participants[i].Color">@Participants[i].Name</strong>
                 <div class="toolbar-separator"></div>
-                @foreach (string color in Palette)
-                {
-                    <button type="button" class="swatch @(_colors[i] == color ? "active" : null)" style="background:@color"
-                            aria-label="@($"{Participants[i].Name} colour {color}")" @onclick="() => SetColor(i, color)"></button>
-                }
+                <ColorSwatches Colors="Palette" Value="@_colors[i]" ValueChanged="color => SetColor(i, color)"
+                               Label="@($"{Participants[i].Name}'s colour")" Prefix="@Participants[i].Name" />
                 <div class="toolbar-spacer"></div>
-                <button type="button" class="btn" @onclick="() => _canvases[i]?.Undo()">Undo</button>
-                <button type="button" class="btn danger" @onclick="() => _canvases[i]?.Clear()">Clear</button>
+                <button type="button" class="btn" disabled="@(_canvases[i] is not { History.CanUndo: true })" @onclick="() => _canvases[i]?.Undo()">Undo</button>
+                <button type="button" class="btn" disabled="@(_canvases[i] is not { History.CanRedo: true })" @onclick="() => _canvases[i]?.Redo()">Redo</button>
+                <button type="button" class="btn danger" disabled="@_documents[i].IsEmpty" @onclick="() => _canvases[i]?.Clear()">Clear</button>
             </div>
 
-            <InkCanvas @ref="_canvases[i]"
-                       EnableTouchGestures="true"
-                       Document="_documents[i]"
-                       Height="380px"
-                       Brush="_brushes[i]"
-                       AriaLabel="@($"{Participants[i].Name}'s canvas")"
-                       StrokeCompleted="() => OnStrokeCompleted(i)"
-                       DocumentChanged="() => StateHasChanged()" />
+            <PointerTracker Moved="(position, pressed) => OnPointerMoved(i, position, pressed)" Left="() => OnPointerLeft(i)">
+                <InkCanvas @ref="_canvases[i]" HistoryChanged="() => StateHasChanged()"
+                           EnableTouchGestures="true"
+                           Document="_documents[i]"
+                           Height="380px"
+                           Brush="_brushes[i]"
+                           AriaLabel="@($"{Participants[i].Name}'s canvas")"
+                           StrokeCompleted="() => OnStrokeCompleted(i)"
+                           DocumentChanged="() => StateHasChanged()"
+                           Ready="() => StateHasChanged()" />
+                <PresenceOverlay Session="_sessions[i]" Canvas="_canvases[i]" />
+            </PointerTracker>
 
             <div class="statusbar">
                 <span><strong>@_documents[i].ElementCount</strong> elements</span>
                 <span>sent <strong>@(_transports[i]?.SentCount ?? 0)</strong> messages, <strong>@FormatBytes(_transports[i]?.SentBytes ?? 0)</strong></span>
-                <span class="badge @(IsOnline(i) ? "on" : null)">@(IsOnline(i) ? "connected" : "offline")</span>
+                @if (_transports[i]?.InboxCount is > 0 and var waiting)
+                {
+                    <span><strong>@waiting</strong> waiting on the server</span>
+                }
+                <span class="badge @(_online[i] ? "on" : null)">@(_online[i] ? "connected" : "offline")</span>
             </div>
         </div>
     }
@@ -72,15 +80,16 @@
 <h2>What travels on the wire</h2>
 <p class="page-intro">
     Drawing a stroke sends that stroke once, as a single operation. Nothing else is transmitted: not the other
-    strokes, not the document. The most recent message is shown below exactly as it was sent.
+    strokes, not the document. While the pen is down, the stroke in progress travels as presence, throttled, so
+    the other side sees it being drawn. The most recent operation is shown below exactly as it was sent.
 </p>
 <pre class="output"><code>@(_lastMessage ?? "Draw on one of the canvases to see the operation that is sent.")</code></pre>
 
 <div class="note">
     Conflicts are resolved by last-writer-wins on each element's version, with the participant id breaking ties so
     every replica reaches the same result. Two people drawing at once never conflict, because each stroke is a new
-    element with its own id. Take a participant offline, draw, and bring them back: their operations are queued and
-    replayed on reconnect.
+    element with its own id. Take a participant offline and draw on both sides: the offline side queues what it
+    sends, the server keeps what is sent to it, and on reconnect both catch up until the replicas are identical.
 </div>
 
 @code {
@@ -94,6 +103,9 @@
 
     private static readonly string[] Palette = ["#2563eb", "#16a34a", "#dc2626", "#111827"];
 
+    /// <summary>Longest stroke in progress sent as presence; enough to show it, small enough to send often.</summary>
+    private const int MaxLivePoints = 400;
+
     private readonly LoopbackHub _hub = new();
     private readonly InkCanvas?[] _canvases = new InkCanvas?[2];
     private readonly InkDocument[] _documents = new InkDocument[2];
@@ -101,10 +113,22 @@
     private readonly LoopbackTransport?[] _transports = new LoopbackTransport?[2];
     private readonly Brush[] _brushes = new Brush[2];
     private readonly string[] _colors = ["#2563eb", "#16a34a"];
+    private readonly bool[] _online = [true, true];
+    private readonly List<Vector2>?[] _live = new List<Vector2>?[2];
+    private readonly CancellationTokenSource _stop = new();
     private string? _lastMessage;
     private int _latency;
-    private bool _leftOnline = true;
-    private bool _rightOnline = true;
+
+    /// <summary>True when both documents hold the same elements at the same versions.</summary>
+    private bool Converged
+    {
+        get
+        {
+            var left = _documents[0].AllElements.ToDictionary(e => e.Id, e => e.Version);
+            var right = _documents[1].AllElements.ToDictionary(e => e.Id, e => e.Version);
+            return left.Count == right.Count && left.All(pair => right.TryGetValue(pair.Key, out int version) && version == pair.Value);
+        }
+    }
 
     protected override void OnInitialized()
     {
@@ -126,9 +150,67 @@
             session.RemoteOperationRejected += reason => { _lastMessage = "Rejected: " + reason; InvokeAsync(StateHasChanged); };
             _sessions[i] = session;
         }
+
+        _ = FlushPresenceLoopAsync(_stop.Token);
     }
 
-    private bool IsOnline(int index) => index == 0 ? _leftOnline : _rightOnline;
+    /// <summary>
+    /// Presence is throttled, so the last position of a fast movement can be held back. Flushing on a timer makes
+    /// sure the other side always ends up seeing where the pointer actually stopped.
+    /// </summary>
+    private async Task FlushPresenceLoopAsync(CancellationToken cancellationToken)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(60));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellationToken))
+            {
+                foreach (CollaborationSession? session in _sessions)
+                {
+                    if (session is not null && _online[Array.IndexOf(_sessions, session)]) await session.FlushPresenceAsync(cancellationToken);
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The page was closed.
+        }
+    }
+
+    private void OnPointerMoved(int index, Vector2 viewPosition, bool pressed)
+    {
+        if (_canvases[index] is not { } canvas || _sessions[index] is not { } session || !_online[index]) return;
+        Vector2 position = canvas.CurrentViewport.ToDocument(viewPosition);
+
+        if (pressed)
+        {
+            List<Vector2> live = _live[index] ??= [];
+            if (live.Count < MaxLivePoints) live.Add(position);
+        }
+        else
+        {
+            _live[index] = null;
+        }
+        _ = session.UpdatePresenceAsync(CreatePresence(index, position));
+    }
+
+    private void OnPointerLeft(int index)
+    {
+        _live[index] = null;
+        if (_sessions[index] is { } session && _online[index]) _ = session.UpdatePresenceAsync(CreatePresence(index, null));
+    }
+
+    private PresenceState CreatePresence(int index, Vector2? cursor) => new()
+    {
+        ParticipantId = Participants[index].Id,
+        Name = Participants[index].Name,
+        Color = Participants[index].Color,
+        Cursor = cursor,
+        // The list is copied: the session keeps the state it is given until it is sent.
+        LiveStroke = _live[index]?.ToArray(),
+        LiveStrokeColor = _colors[index],
+        LiveStrokeWidth = 4f,
+    };
 
     private void SetColor(int index, string color)
     {
@@ -136,11 +218,12 @@
         _brushes[index] = new PenBrush { Width = 4f, Color = InkColor.Parse(color) };
     }
 
-    private void SetOnline(int index, bool online)
+    private async Task SetOnlineAsync(int index, bool online)
     {
-        if (index == 0) _leftOnline = online;
-        else _rightOnline = online;
-        _transports[index]?.SetConnected(online);
+        _online[index] = online;
+        if (_transports[index] is { } transport) await transport.SetConnectedAsync(online);
+        // The session flushes its queue when the transport reports the connection; let that finish first.
+        if (online && _sessions[index] is { } session) await session.FlushAsync();
         StateHasChanged();
     }
 
@@ -155,6 +238,8 @@
 
     private void OnStrokeCompleted(int index)
     {
+        _live[index] = null;
+
         // Show the exact payload that was sent for the last stroke.
         if (_documents[index].Layers[0].Elements.Count == 0) return;
         InkElement last = _documents[index].Layers[0].Elements[^1];
@@ -169,9 +254,11 @@
 
     public async ValueTask DisposeAsync()
     {
+        _stop.Cancel();
         foreach (CollaborationSession? session in _sessions)
         {
             if (session is not null) await session.DisposeAsync();
         }
+        _stop.Dispose();
     }
 }

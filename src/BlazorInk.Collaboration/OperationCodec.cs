@@ -117,6 +117,15 @@ public static class OperationCodec
         writer.WriteBoolean("visible", properties.IsVisible);
         writer.WriteBoolean("locked", properties.IsLocked);
         writer.WriteNumber("opacity", properties.Opacity);
+        // A layer update replaces the whole property set, so metadata left off the wire would be erased on every
+        // other replica by something as small as renaming the layer.
+        if (properties.Metadata is { Count: > 0 } metadata)
+        {
+            writer.WritePropertyName("metadata");
+            writer.WriteStartObject();
+            foreach ((string key, string value) in metadata.OrderBy(static kv => kv.Key, StringComparer.Ordinal)) writer.WriteString(key, value);
+            writer.WriteEndObject();
+        }
         writer.WriteEndObject();
     }
 
@@ -134,6 +143,13 @@ public static class OperationCodec
         catch (JsonException ex)
         {
             throw new InkFormatException("The operation is not valid JSON.", ex);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or FormatException or OverflowException)
+        {
+            // A value of the wrong JSON kind, such as a number where a string belongs, makes JsonElement throw
+            // InvalidOperationException. The session only expects InkFormatException from an untrusted payload,
+            // so anything else would escape the receive callback and take the transport down with it.
+            throw new InkFormatException("The operation is malformed: " + ex.Message, ex);
         }
     }
 
@@ -219,7 +235,21 @@ public static class OperationCodec
             IsVisible = !properties.TryGetProperty("visible", out JsonElement v) || v.ValueKind != JsonValueKind.False,
             IsLocked = properties.TryGetProperty("locked", out JsonElement l) && l.ValueKind == JsonValueKind.True,
             Opacity = properties.TryGetProperty("opacity", out JsonElement o) && o.TryGetSingle(out float opacity) ? Math.Clamp(opacity, 0f, 1f) : 1f,
+            Metadata = ReadMetadata(properties),
         };
+    }
+
+    private static Dictionary<string, string>? ReadMetadata(JsonElement element)
+    {
+        if (!element.TryGetProperty("metadata", out JsonElement metadata) || metadata.ValueKind != JsonValueKind.Object) return null;
+        Dictionary<string, string>? result = null;
+        foreach (JsonProperty property in metadata.EnumerateObject())
+        {
+            if (property.Name.Length == 0 || property.Value.ValueKind != JsonValueKind.String) continue;
+            result ??= new Dictionary<string, string>(StringComparer.Ordinal);
+            result[property.Name] = property.Value.GetString()!;
+        }
+        return result;
     }
 
     private static Guid ReadGuid(JsonElement element, string name)

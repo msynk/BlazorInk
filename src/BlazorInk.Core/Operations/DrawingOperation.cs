@@ -231,8 +231,19 @@ public sealed record BatchOperation(IReadOnlyList<DrawingOperation> Operations, 
         }
         catch
         {
-            // Roll back the partially applied batch so the document is never left half-changed.
-            for (int i = 0; i < applied; i++) inverses[Operations.Count - applied + i].ApplyCore(document);
+            // Roll back the partially applied batch so the document is never left half-changed. The rollback is
+            // never reported, so it has to restore elements exactly: a replacement undone the ordinary way gets a
+            // newer version, and this replica would then out-rank every collaborator's next edit of the element.
+            bool restoring = document.Restoring;
+            document.Restoring = true;
+            try
+            {
+                for (int i = 0; i < applied; i++) inverses[Operations.Count - applied + i].ApplyCore(document);
+            }
+            finally
+            {
+                document.Restoring = restoring;
+            }
             throw;
         }
         return new BatchOperation(inverses, Label);

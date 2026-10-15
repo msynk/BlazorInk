@@ -87,8 +87,9 @@ the change that caused them, not before it.
 The document reports that relationship. A change applied while another change is being reported is nested inside
 it, and its `DocumentChangedEventArgs.Depth` is greater than zero. History holds those consequential entries back
 until the whole notification has finished and then records them after their cause, so the result does not depend
-on whether the application subscribed to `Changed` before or after the history manager did. With a group open, as
-during any gesture, the cause and its consequences become one undo step.
+on whether the application subscribed to `Changed` before or after the history manager did. The cause and its
+consequences become one undo step, whether the cause came from a tool's gesture or a direct API call; only a
+consequence of a change history does not record, such as a remote edit, is a step of its own.
 
 The demo's diagram page is built on exactly this: moving a node and re-routing its four connectors is a single
 undo, and it is covered by tests at both the model and browser level.

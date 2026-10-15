@@ -138,6 +138,42 @@ public class SerializationRegressionTests(ITestOutputHelper output)
     }
 
     [Fact]
+    public void A_loaded_page_size_is_clamped_like_an_edited_one()
+    {
+        // UpdateSettings clamps the page to the coordinate limit; a file used to be able to declare any size.
+        InkDocument document = InkSerializer.Deserialize("{\"format\":\"blazorink\",\"version\":1,\"settings\":{\"width\":1e30,\"height\":-5},\"layers\":[]}");
+        Assert.Equal(document.Limits.MaxCoordinate, document.Settings.Width);
+        Assert.Equal(0f, document.Settings.Height);
+    }
+
+    [Fact]
+    public void The_total_point_limit_holds_within_a_single_layer()
+    {
+        // Each stroke was checked against the document's total before any of its layer was counted, so one layer
+        // could carry any number of points past MaxTotalPoints.
+        var source = new InkDocument();
+        for (int i = 0; i < 3; i++) source.AddElement(new Stroke(TestData.Line(new Vector2(i * 10, 0), new Vector2(i * 10, 100), 40), new PenBrush()));
+        string json = InkSerializer.Serialize(source);
+        var options = new InkDeserializerOptions { Limits = DocumentLimits.Default with { MaxTotalPoints = 100 } };
+
+        Assert.Throws<InkFormatException>(() => InkSerializer.Deserialize(json, options));
+    }
+
+    [Fact]
+    public void A_layer_arriving_with_repeated_element_ids_is_refused()
+    {
+        // A collaborator's addLayer is not repaired the way a loaded file is. Two elements behind one index entry
+        // would leave one of them impossible to select, delete or undo.
+        var document = new InkDocument();
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(10, 10));
+        var add = new Operations.AddLayerOperation(Guid.NewGuid(), new LayerProperties(), null, [stroke, stroke with { Description = "twin" }]);
+
+        Assert.Throws<InvalidOperationException>(() => document.Apply(add, ChangeOrigin.Remote));
+        Assert.Single(document.Layers);
+        Assert.Equal(0, document.ElementCount);
+    }
+
+    [Fact]
     public void Every_sample_export_is_well_formed_and_has_a_sane_view_box()
     {
         InkDocument document = TestData.SampleDocument();

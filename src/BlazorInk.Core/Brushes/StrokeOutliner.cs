@@ -119,9 +119,10 @@ public static class StrokeOutliner
 
         if (n == 1 || totalLength < GeometryMath.Epsilon)
         {
-            // A dot: a circle of the pressure-scaled radius (never smaller than a visible minimum).
+            // A dot: a circle of the pressure-scaled radius (never smaller than a visible minimum). AddArc skips the
+            // start angle, so the end (the same angle, a full turn later) must be included or one vertex is missing.
             float r = MathF.Max(halfWidth * curve.Apply(points.Pressure[0]), halfWidth * 0.35f);
-            AddArc(polygon, points.PositionAt(0), r, 0f, MathF.PI * 2f, 16, includeEnd: false);
+            AddArc(polygon, points.PositionAt(0), r, 0f, MathF.PI * 2f, 16, includeEnd: true);
             return;
         }
 
@@ -152,7 +153,7 @@ public static class StrokeOutliner
             // Every step is below the epsilon used to derive a direction, yet the points span enough distance to
             // get here. Without a direction the outline would collapse, so draw the stroke as a dot instead.
             float r = MathF.Max(halfWidth * curve.Apply(points.Pressure[0]), halfWidth * 0.35f);
-            AddArc(polygon, points.PositionAt(0), r, 0f, MathF.PI * 2f, 16, includeEnd: false);
+            AddArc(polygon, points.PositionAt(0), r, 0f, MathF.PI * 2f, 16, includeEnd: true);
             return;
         }
 

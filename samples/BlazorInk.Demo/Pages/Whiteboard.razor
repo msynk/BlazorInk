@@ -1,6 +1,9 @@
 @page "/whiteboard"
 @using BlazorInk.Export
+@using BlazorInk.Operations
+@using BlazorInk.Serialization
 @using System.Numerics
+@inject FileDownloads Downloads
 
 <PageTitle>Whiteboard</PageTitle>
 
@@ -23,13 +26,7 @@
 
         <div class="toolbar-separator"></div>
 
-        <div class="toolbar-group" role="group" aria-label="Colour">
-            @foreach (string color in Palette)
-            {
-                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
-                        aria-label="@color" @onclick="() => SetColor(color)"></button>
-            }
-        </div>
+        <ColorSwatches Colors="Palette" Value="@_color" ValueChanged="SetColor" />
 
         <div class="toolbar-separator"></div>
 
@@ -38,6 +35,14 @@
             <input type="range" min="1" max="40" step="1" value="@_width" aria-label="Size" @onchange="OnWidthChanged" />
             <span style="min-width:2ch">@((int)_width)</span>
         </label>
+
+        @if (_toolId is "rect" or "ellipse")
+        {
+            <label class="field">
+                <input type="checkbox" checked="@_fill" @onchange="OnFillChanged" />
+                Fill
+            </label>
+        }
 
         @if (_toolId == "eraser")
         {
@@ -55,10 +60,10 @@
 
         <div class="toolbar-group" role="group" aria-label="History">
             <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)"
-                    @onclick="() => _canvas?.Undo()">Undo</button>
+                    title="Undo (Ctrl+Z)" @onclick="() => _canvas?.Undo()">Undo</button>
             <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)"
-                    @onclick="() => _canvas?.Redo()">Redo</button>
-            <button type="button" class="btn danger" @onclick="() => _canvas?.Clear()">Clear</button>
+                    title="Redo (Ctrl+Shift+Z)" @onclick="() => _canvas?.Redo()">Redo</button>
+            <button type="button" class="btn danger" disabled="@_document.IsEmpty" @onclick="() => _canvas?.Clear()">Clear</button>
         </div>
     </div>
 
@@ -78,22 +83,43 @@
                 <select value="@_activeLayer" @onchange="OnLayerChanged" aria-label="Active layer">
                     @foreach (Layer layer in _document.Layers.Reverse())
                     {
-                        <option value="@layer.Id">@layer.Name</option>
+                        <option value="@layer.Id">@LayerLabel(layer)</option>
                     }
                 </select>
             </label>
             <button type="button" class="btn" @onclick="AddLayer">Add layer</button>
-            <button type="button" class="btn" @onclick="ToggleLayerVisibility">
-                @(ActiveLayerVisible ? "Hide" : "Show")
-            </button>
+            <button type="button" class="btn" aria-pressed="@(ActiveLayer?.IsVisible == false ? "true" : "false")"
+                    @onclick="ToggleLayerVisibility">@(ActiveLayer?.IsVisible == false ? "Show" : "Hide")</button>
+            <button type="button" class="btn" aria-pressed="@(ActiveLayer?.IsLocked == true ? "true" : "false")"
+                    @onclick="ToggleLayerLock">@(ActiveLayer?.IsLocked == true ? "Unlock" : "Lock")</button>
+            <button type="button" class="btn danger" disabled="@(_document.Layers.Count < 2)" @onclick="DeleteLayer">Delete layer</button>
         </div>
 
         <div class="toolbar-spacer"></div>
 
-        <div class="toolbar-group">
-            <button type="button" class="btn" @onclick="ExportSvgAsync">Export SVG</button>
-            <button type="button" class="btn" @onclick="ExportPngAsync">Export PNG</button>
+        <div class="toolbar-group" role="group" aria-label="File">
+            <label class="btn">
+                Open
+                <InputFile OnChange="OpenAsync" accept=".json,.blazorink,application/json" style="display:none" />
+            </label>
+            <button type="button" class="btn" @onclick="SaveAsync">Save</button>
+            <button type="button" class="btn" disabled="@_document.IsEmpty" @onclick="ExportSvgAsync">Export SVG</button>
+            <button type="button" class="btn" disabled="@_document.IsEmpty" @onclick="ExportPngAsync">Export PNG</button>
         </div>
+    </div>
+
+    <div class="toolbar" style="border-top:none" role="toolbar" aria-label="Selection">
+        <div class="toolbar-group" role="group" aria-label="Arrange">
+            <button type="button" class="btn" disabled="@_document.IsEmpty" title="Select all (Ctrl+A)" @onclick="SelectAll">Select all</button>
+            <button type="button" class="btn" disabled="@(!HasSelection)" title="Duplicate (Ctrl+D)" @onclick="Duplicate">Duplicate</button>
+            <button type="button" class="btn" disabled="@(!HasSelection)" @onclick="() => Arrange(toFront: true)">Bring to front</button>
+            <button type="button" class="btn" disabled="@(!HasSelection)" @onclick="() => Arrange(toFront: false)">Send to back</button>
+            <button type="button" class="btn danger" disabled="@(!HasSelection)" title="Delete" @onclick="() => _canvas?.DeleteSelection()">Delete</button>
+        </div>
+        @if (_message is not null)
+        {
+            <span class="field" role="status">@_message</span>
+        }
     </div>
 
     <div class="canvas-host">
@@ -107,6 +133,7 @@
                    EnableTouchGestures="true"
                    AriaLabel="Whiteboard"
                    DocumentChanged="() => StateHasChanged()"
+                   HistoryChanged="() => StateHasChanged()"
                    Ready="() => StateHasChanged()"
                    SelectionChanged="() => StateHasChanged()" />
     </div>
@@ -120,20 +147,23 @@
 <div class="note">
     Selection has real handles: drag inside the box to move, the corners and edges to resize, the circle above it
     to rotate. Manipulation only changes each element's transform, so the vector data is never rewritten and undo
-    restores it exactly. Arrow keys nudge, Shift makes larger steps, Delete removes.
+    restores it exactly. Arrow keys nudge, Shift makes larger steps, Delete removes. A locked layer is skipped by
+    selection and erasing, and saving writes the whole board, layers included, as a file you can open again.
 </div>
 
 @code {
     private InkCanvas? _canvas;
-    private readonly InkDocument _document = CreateDocument();
+    private InkDocument _document = CreateDocument();
     private Guid _activeLayer;
     private string _toolId = "draw";
     private string _color = "#111827";
     private float _width = 4f;
+    private bool _fill;
     private string _eraserMode = "Stroke";
     private ITool _tool = new DrawTool();
     private Brush _brush = new PenBrush { Width = 4f, Color = InkColor.Parse("#111827") };
     private ShapeStyle _shapeStyle = new() { StrokeColor = InkColor.Parse("#111827"), StrokeWidth = 3f };
+    private string? _message;
 
     private static readonly (string Id, string Label, string Title)[] ToolButtons =
     [
@@ -165,13 +195,23 @@
         _activeLayer = _document.Layers[0].Id;
     }
 
-    private bool ActiveLayerVisible => _document.TryGetLayer(_activeLayer, out Layer? layer) && layer.IsVisible;
+    private Layer? ActiveLayer => _document.TryGetLayer(_activeLayer, out Layer? layer) ? layer : null;
+
+    private bool HasSelection => _canvas is not null && !_canvas.Selection.IsEmpty;
+
+    private static string LayerLabel(Layer layer)
+        => layer.Name + (layer.IsVisible ? null : " (hidden)") + (layer.IsLocked ? " (locked)" : null);
 
     private void SelectTool(string id)
     {
         _toolId = id;
         InkColor color = InkColor.Parse(_color);
-        _shapeStyle = _shapeStyle with { StrokeColor = color, StrokeWidth = MathF.Max(_width * 0.75f, 1f) };
+        _shapeStyle = _shapeStyle with
+        {
+            StrokeColor = color,
+            StrokeWidth = MathF.Max(_width * 0.75f, 1f),
+            FillColor = _fill ? color with { A = 48 } : null,
+        };
 
         switch (id)
         {
@@ -208,7 +248,7 @@
                 _tool = new ShapeTool(ShapeKind.Arrow);
                 break;
             case "text":
-                _tool = new TextTool { Style = TextStyle.Default with { FontSize = MathF.Max(_width * 4f, 14f) } };
+                _tool = new TextTool { Style = TextStyle.Default with { FontSize = MathF.Max(_width * 4f, 14f), Color = color } };
                 break;
             case "pan":
                 _tool = new PanTool();
@@ -231,6 +271,12 @@
         }
     }
 
+    private void OnFillChanged(ChangeEventArgs e)
+    {
+        _fill = e.Value is true;
+        SelectTool(_toolId);
+    }
+
     private void OnEraserModeChanged(ChangeEventArgs e)
     {
         _eraserMode = e.Value?.ToString() ?? "Stroke";
@@ -250,10 +296,104 @@
 
     private void ToggleLayerVisibility()
     {
-        if (!_document.TryGetLayer(_activeLayer, out Layer? layer)) return;
+        if (ActiveLayer is not { } layer) return;
         bool visible = layer.IsVisible;
-        _document.UpdateLayer(_activeLayer, p => p with { IsVisible = !visible });
+        _document.UpdateLayer(layer.Id, p => p with { IsVisible = !visible });
         _canvas?.Refresh();
+    }
+
+    private void ToggleLayerLock()
+    {
+        if (ActiveLayer is not { } layer) return;
+        bool locked = layer.IsLocked;
+        _document.UpdateLayer(layer.Id, p => p with { IsLocked = !locked });
+        // A locked layer cannot keep a selection: what is selected there could still be moved by the keyboard.
+        if (!locked) _canvas?.Selection.Set(_canvas.Selection.Ids.Where(id => _document.GetLayerOf(id)?.Id != layer.Id));
+    }
+
+    private void DeleteLayer()
+    {
+        if (ActiveLayer is not { } layer || _document.Layers.Count < 2) return;
+        _document.RemoveLayer(layer.Id);
+        _activeLayer = _document.Layers[^1].Id;
+        _canvas?.Refresh();
+    }
+
+    private void SelectAll()
+    {
+        if (_toolId != "select") SelectTool("select");
+        _canvas?.SelectAll();
+    }
+
+    /// <summary>Copies the selection, offset so the copy is visible, and selects the copy.</summary>
+    private void Duplicate()
+    {
+        if (_canvas is null || _canvas.Selection.IsEmpty) return;
+        var copies = new List<Guid>();
+        using (_document.BeginBatch("Duplicate"))
+        {
+            foreach (InkElement element in _canvas.Selection.Elements.ToList())
+            {
+                Guid? layer = _document.GetLayerOf(element.Id)?.Id;
+                InkElement copy = element.Translate(new Vector2(16f, 16f)) with { Id = Guid.NewGuid(), Version = 0 };
+                _document.AddElement(copy, layer);
+                copies.Add(copy.Id);
+            }
+        }
+        _canvas.Selection.Set(copies);
+        _message = copies.Count == 1 ? "Duplicated 1 element." : $"Duplicated {copies.Count} elements.";
+    }
+
+    /// <summary>Moves the selection to the top or bottom of its layer, keeping the selected elements' own order.</summary>
+    private void Arrange(bool toFront)
+    {
+        if (_canvas is null || _canvas.Selection.IsEmpty) return;
+        // Work in document order so the selected elements keep their relative stacking.
+        List<InkElement> ordered = _document.AllElements.Where(e => _canvas.Selection.Contains(e.Id)).ToList();
+        if (!toFront) ordered.Reverse();
+        using (_document.BeginBatch(toFront ? "Bring to front" : "Send to back"))
+        {
+            foreach (InkElement element in ordered)
+            {
+                if (_document.GetLayerOf(element.Id) is not { } layer) continue;
+                _document.Apply(new ReorderElementOperation(element.Id, layer.Id, toFront ? null : 0));
+            }
+        }
+        _canvas.Refresh();
+    }
+
+    private async Task SaveAsync()
+    {
+        byte[] bytes = InkSerializer.SerializeToUtf8Bytes(_document);
+        await Downloads.SaveAsync("whiteboard.blazorink.json", bytes, "application/json");
+        _message = $"Saved {bytes.Length / 1024.0:0.#} KB.";
+    }
+
+    private async Task OpenAsync(InputFileChangeEventArgs args)
+    {
+        const long maxBytes = 20 * 1024 * 1024;
+        try
+        {
+            using var buffer = new MemoryStream();
+            await using (Stream stream = args.File.OpenReadStream(maxBytes))
+            {
+                await stream.CopyToAsync(buffer);
+            }
+            string json = System.Text.Encoding.UTF8.GetString(buffer.ToArray());
+            if (!InkSerializer.TryDeserialize(json, out InkDocument? document, out string? error) || document is null)
+            {
+                _message = "That file could not be opened: " + error;
+                return;
+            }
+            // Swapping the Document parameter is all it takes: the canvas resets its history and selection.
+            _document = document;
+            _activeLayer = _document.Layers[^1].Id;
+            _message = $"Opened {args.File.Name}: {_document.ElementCount} elements on {_document.Layers.Count} layers.";
+        }
+        catch (IOException ex)
+        {
+            _message = "That file could not be read: " + ex.Message;
+        }
     }
 
     private Task ExportSvgAsync()

@@ -126,9 +126,29 @@ public class OperationCodecTests
     [InlineData("{\"op\":\"nonsense\"}")]
     [InlineData("{\"op\":\"add\"}")]
     [InlineData("{\"op\":\"remove\",\"element\":\"not-a-guid\"}")]
+    // Values of the wrong JSON kind used to escape as InvalidOperationException, which the session does not catch.
+    [InlineData("{\"op\":5}")]
+    [InlineData("{\"op\":\"metadata\",\"key\":5}")]
+    [InlineData("{\"op\":\"batch\",\"label\":5,\"operations\":[]}")]
+    [InlineData("{\"op\":\"settings\",\"background\":5}")]
+    [InlineData("{\"op\":\"updateLayer\",\"layer\":\"00000000-0000-0000-0000-000000000001\",\"properties\":{\"name\":5}}")]
+    [InlineData("{\"op\":\"updateLayer\",\"layer\":\"00000000-0000-0000-0000-000000000001\",\"properties\":{\"opacity\":\"x\"}}")]
     public void Malformed_operations_are_rejected(string json)
     {
         Assert.Throws<InkFormatException>(() => OperationCodec.Deserialize(json));
+    }
+
+    [Fact]
+    public void Layer_metadata_travels_with_layer_operations()
+    {
+        // An update replaces the whole property set, so metadata missing from the wire was erased on every other
+        // replica by something as small as renaming the layer.
+        var properties = new LayerProperties { Name = "Notes", Metadata = new Dictionary<string, string> { ["role"] = "review" } };
+        var decoded = (UpdateLayerOperation)OperationCodec.Deserialize(OperationCodec.Serialize(new UpdateLayerOperation(Guid.NewGuid(), properties)));
+        Assert.Equal("review", decoded.Properties.Metadata?["role"]);
+
+        var added = (AddLayerOperation)OperationCodec.Deserialize(OperationCodec.Serialize(new AddLayerOperation(Guid.NewGuid(), properties)));
+        Assert.Equal("review", added.Properties.Metadata?["role"]);
     }
 }
 
@@ -466,5 +486,195 @@ public class CollaborationSessionTests
             .ToArray();
         Assert.Equal(3, sequences.Length);
         Assert.Equal(sequences.OrderBy(x => x).ToArray(), sequences);
+    }
+}
+
+/// <summary>A transport whose messages the test delivers by hand, so concurrent edits can be interleaved exactly.</summary>
+internal sealed class ManualTransport : ICollaborationTransport
+{
+    public bool IsConnected { get; set; } = true;
+
+    /// <summary>Makes the next operation send fail, as a dropped connection would.</summary>
+    public bool FailNextOperation { get; set; }
+
+    public List<CollaborationMessage> Sent { get; } = new();
+
+    public event Func<CollaborationMessage, Task>? MessageReceived;
+
+    public event Action<bool>? ConnectionChanged;
+
+    public Task SendAsync(CollaborationMessage message, CancellationToken cancellationToken = default)
+    {
+        if (FailNextOperation && message.Kind == CollaborationMessageKind.Operation)
+        {
+            FailNextOperation = false;
+            throw new InvalidOperationException("Connection dropped.");
+        }
+        Sent.Add(message);
+        return Task.CompletedTask;
+    }
+
+    public Task DeliverAsync(CollaborationMessage message) => MessageReceived?.Invoke(message) ?? Task.CompletedTask;
+
+    public void RaiseConnectionChanged() => ConnectionChanged?.Invoke(IsConnected);
+}
+
+public class CollaborationRegressionTests
+{
+    /// <summary>
+    /// Three participants: alex and sam already share two strokes, sam has one more that alex has not seen, and zoe
+    /// joins empty.
+    /// </summary>
+    private static (InkDocument Alex, InkDocument Sam, InkDocument Zoe, TestHub Hub) CreateJoiningTrio()
+    {
+        var alex = new InkDocument(new DocumentSettings { Width = 400, Height = 300 });
+        InkDocument zoe = InkSerializer.Deserialize(InkSerializer.Serialize(alex));
+        alex.AddElement(TestData.Stroke(new Vector2(0, 0), new Vector2(20, 20)));
+        alex.AddElement(TestData.Stroke(new Vector2(40, 0), new Vector2(60, 20)));
+        InkDocument sam = InkSerializer.Deserialize(InkSerializer.Serialize(alex));
+        sam.AddElement(TestData.Stroke(new Vector2(80, 0), new Vector2(100, 20)));
+        return (alex, sam, zoe, new TestHub());
+    }
+
+    [Fact]
+    public async Task A_snapshot_answer_is_applied_only_by_the_participant_that_asked_and_only_once()
+    {
+        (InkDocument alex, InkDocument sam, InkDocument zoe, TestHub hub) = CreateJoiningTrio();
+        await using var sa = new CollaborationSession(alex, hub.CreateClient(), "alex");
+        await using var ss = new CollaborationSession(sam, hub.CreateClient(), "sam");
+        await using var sz = new CollaborationSession(zoe, hub.CreateClient(), "zoe");
+
+        // Both alex and sam answer. Every participant used to apply every answer: sam took alex's copy and lost
+        // the stroke only sam had, and zoe applied both answers, the second overwriting the first.
+        await sz.RequestSnapshotAsync();
+        await Task.Yield();
+
+        Assert.Equal(2, alex.ElementCount);
+        Assert.Equal(3, sam.ElementCount);
+        // Alex answered first; that answer is the one zoe kept.
+        Assert.Equal(alex.AllElements.Select(e => e.Id), zoe.AllElements.Select(e => e.Id));
+    }
+
+    [Fact]
+    public async Task A_snapshot_sent_to_everyone_still_resets_every_participant()
+    {
+        (InkDocument alex, InkDocument sam, InkDocument zoe, TestHub hub) = CreateJoiningTrio();
+        await using var sa = new CollaborationSession(alex, hub.CreateClient(), "alex");
+        await using var ss = new CollaborationSession(sam, hub.CreateClient(), "sam");
+        await using var sz = new CollaborationSession(zoe, hub.CreateClient(), "zoe");
+
+        await sa.SendSnapshotAsync();
+        await Task.Yield();
+
+        Assert.Equal(alex.AllElements.Select(e => e.Id), sam.AllElements.Select(e => e.Id));
+        Assert.Equal(alex.AllElements.Select(e => e.Id), zoe.AllElements.Select(e => e.Id));
+    }
+
+    [Fact]
+    public async Task An_answer_nobody_asked_for_is_ignored()
+    {
+        var local = new InkDocument(new DocumentSettings { Width = 200, Height = 200 });
+        local.AddElement(TestData.Stroke(new Vector2(0, 0), new Vector2(20, 20)));
+        var other = new InkDocument(local.Settings) { Id = local.Id };
+        var transport = new ManualTransport();
+        await using var session = new CollaborationSession(local, transport, "local");
+
+        await transport.DeliverAsync(new CollaborationMessage
+        {
+            Kind = CollaborationMessageKind.Snapshot,
+            SenderId = "peer",
+            RecipientId = "local",
+            DocumentId = local.Id,
+            Sequence = 1,
+            Snapshot = InkSerializer.Serialize(other),
+        });
+
+        Assert.Equal(1, local.ElementCount);
+    }
+
+    [Fact]
+    public async Task Three_participants_agree_on_the_winner_of_a_tied_edit()
+    {
+        // The tie used to be settled between the receiving replica's own id and the sender's. A bystander holding
+        // alex's version then judged sam's version against "zoe", kept alex's and disagreed with alex and sam,
+        // who had both settled on sam's.
+        var a = new InkDocument();
+        Stroke stroke = TestData.Stroke(new Vector2(0, 0), new Vector2(50, 50));
+        a.AddElement(stroke);
+        InkDocument b = InkSerializer.Deserialize(InkSerializer.Serialize(a));
+        InkDocument c = InkSerializer.Deserialize(InkSerializer.Serialize(a));
+
+        ManualTransport ta = new(), tb = new(), tc = new();
+        await using var sa = new CollaborationSession(a, ta, "alex");
+        await using var sb = new CollaborationSession(b, tb, "sam");
+        await using var sc = new CollaborationSession(c, tc, "zoe");
+
+        a.ReplaceElement(a.GetElement(stroke.Id) with { Description = "from alex" });
+        b.ReplaceElement(b.GetElement(stroke.Id) with { Description = "from sam" });
+        CollaborationMessage fromAlex = Assert.Single(ta.Sent);
+        CollaborationMessage fromSam = Assert.Single(tb.Sent);
+
+        await tb.DeliverAsync(fromAlex);
+        await tc.DeliverAsync(fromAlex);
+        await ta.DeliverAsync(fromSam);
+        await tc.DeliverAsync(fromSam);
+
+        string? winner = a.GetElement(stroke.Id).Description;
+        Assert.Equal(winner, b.GetElement(stroke.Id).Description);
+        Assert.Equal(winner, c.GetElement(stroke.Id).Description);
+
+        // The replica that took the winning edit stores it at the version it was sent with. Bumping it left that
+        // replica a version ahead of the others, so the next edit from anyone was ordered differently there.
+        Assert.Equal(a.GetElement(stroke.Id).Version, b.GetElement(stroke.Id).Version);
+        Assert.Equal(a.GetElement(stroke.Id).Version, c.GetElement(stroke.Id).Version);
+    }
+
+    [Fact]
+    public async Task Presence_does_not_overtake_queued_operations()
+    {
+        // Presence and operations share the sender's sequence. A presence update sent past a queued operation
+        // made the receiver discard that operation as a late arrival once the queue drained.
+        var local = new InkDocument();
+        InkDocument remote = InkSerializer.Deserialize(InkSerializer.Serialize(local));
+        var transport = new ManualTransport { FailNextOperation = true };
+        var peer = new ManualTransport();
+        await using var session = new CollaborationSession(local, transport, "local");
+        await using var receiver = new CollaborationSession(remote, peer, "remote");
+
+        local.AddElement(TestData.Stroke(new Vector2(0, 0), new Vector2(20, 20)));
+        Assert.Equal(1, session.PendingCount);
+
+        await session.UpdatePresenceAsync(new PresenceState { ParticipantId = "local", Cursor = new Vector2(5, 5) });
+        await session.FlushAsync();
+        Assert.Equal(0, session.PendingCount);
+
+        foreach (CollaborationMessage message in transport.Sent.ToArray()) await peer.DeliverAsync(message);
+
+        Assert.Equal(1, remote.ElementCount);
+    }
+
+    [Fact]
+    public async Task A_snapshot_brings_settings_metadata_and_layer_order_along()
+    {
+        // Only layers and elements were synchronized: a joining participant kept its own page and metadata, and
+        // layers it already had stayed in its own order.
+        var a = new InkDocument(new DocumentSettings { Width = 400, Height = 300 });
+        Layer top = a.AddLayer("Top");
+        InkDocument b = InkSerializer.Deserialize(InkSerializer.Serialize(a));
+        a.ReorderLayer(top.Id, 0);
+        a.UpdateSettings(new DocumentSettings { Width = 1000, Height = 700, Background = InkColor.Parse("#123456") });
+        a.SetMetadata("case", "42");
+        b.SetMetadata("stale", "x");
+
+        var hub = new TestHub();
+        await using var sa = new CollaborationSession(a, hub.CreateClient(), "alex");
+        await using var sb = new CollaborationSession(b, hub.CreateClient(), "sam");
+        await sb.RequestSnapshotAsync();
+        await Task.Yield();
+
+        Assert.Equal(a.Layers.Select(l => l.Id), b.Layers.Select(l => l.Id));
+        Assert.Equal(a.Settings, b.Settings);
+        Assert.Equal("42", b.Metadata["case"]);
+        Assert.False(b.Metadata.ContainsKey("stale"));
     }
 }

@@ -1,5 +1,8 @@
 @page "/document-annotation"
 @using System.Numerics
+@using BlazorInk.Export
+@using BlazorInk.Operations
+@implements IDisposable
 
 <PageTitle>Document review</PageTitle>
 
@@ -14,42 +17,42 @@
 <div class="panel">
     <div class="toolbar" role="toolbar" aria-label="Review tools">
         <div class="toolbar-group" role="group" aria-label="Tool">
-            <button type="button" class="btn @(_toolId == "select" ? "active" : null)" @onclick='() => SelectTool("select")'>Select</button>
-            <button type="button" class="btn @(_toolId == "highlight" ? "active" : null)" @onclick='() => SelectTool("highlight")'>Highlight text</button>
-            <button type="button" class="btn @(_toolId == "callout" ? "active" : null)" @onclick='() => SelectTool("callout")'>Add comment</button>
-            <button type="button" class="btn @(_toolId == "draw" ? "active" : null)" @onclick='() => SelectTool("draw")'>Freehand</button>
+            @foreach ((string id, string label) in Tools)
+            {
+                <button type="button" class="btn @(_toolId == id ? "active" : null)"
+                        aria-pressed="@(_toolId == id ? "true" : "false")"
+                        @onclick="() => SelectTool(id)">@label</button>
+            }
         </div>
 
         <div class="toolbar-separator"></div>
 
-        <div class="toolbar-group" role="group" aria-label="Highlight colour">
-            @foreach ((string color, string name) in HighlightColors)
-            {
-                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
-                        aria-label="@name" @onclick="() => SetColor(color)"></button>
-            }
-        </div>
+        <ColorSwatches Colors="HighlightColors" Value="@_color" ValueChanged="SetColor" Label="Highlight colour" />
 
         <div class="toolbar-spacer"></div>
         <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)" @onclick="() => _canvas?.Undo()">Undo</button>
-        <button type="button" class="btn danger" disabled="@(_annotations.Count == 0)" @onclick="ClearAnnotations">Clear comments</button>
+        <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)" @onclick="() => _canvas?.Redo()">Redo</button>
+        <button type="button" class="btn" @onclick="ExportSvgAsync">Export SVG</button>
+        <button type="button" class="btn danger" disabled="@(_annotations.Count == 0)" @onclick="ClearAnnotations">Clear annotations</button>
     </div>
 
     <div class="split" style="gap:0">
         <div style="position:relative;background:var(--surface)">
-            <InkCanvas @ref="_canvas"
+            <InkCanvas @ref="_canvas" Ready="() => StateHasChanged()" HistoryChanged="() => StateHasChanged()"
                        EnableTouchGestures="true"
                        Document="_document"
                        Height="620px"
                        Tool="_tool"
                        Brush="_brush"
+                       ShapeStyle="_shapeStyle"
                        ActiveLayerId="_annotationLayer"
                        AriaLabel="Document under review"
+                       SelectionChanged="() => StateHasChanged()"
                        DocumentChanged="OnDocumentChanged" />
         </div>
 
         <div style="padding:1rem;border-left:1px solid var(--border);overflow:auto;max-height:620px">
-            <h2 style="margin-top:0">Comments</h2>
+            <h2 style="margin-top:0">Annotations</h2>
             @if (_annotations.Count == 0)
             {
                 <p style="color:var(--text-muted);font-size:0.87rem">
@@ -61,14 +64,29 @@
                 <ul style="list-style:none;padding:0;margin:0;display:grid;gap:0.6rem">
                     @foreach (AnnotationEntry entry in _annotations)
                     {
-                        <li class="card" style="padding:0.7rem 0.8rem">
+                        bool selected = _canvas?.Selection.Contains(entry.Id) == true;
+                        <li class="card" style="padding:0.7rem 0.8rem;@(selected ? "border-color:var(--accent)" : null)">
                             <div style="display:flex;justify-content:space-between;gap:0.5rem;align-items:start">
-                                <div>
+                                <div style="flex:1;min-width:0">
                                     <strong style="font-size:0.85rem">@entry.Kind</strong>
-                                    <div style="color:var(--text-muted);font-size:0.85rem">@entry.Text</div>
+                                    @if (entry.Editable)
+                                    {
+                                        <textarea rows="2" maxlength="500" aria-label="Comment text"
+                                                  style="display:block;width:100%;margin-top:0.3rem;font:inherit;font-size:0.85rem"
+                                                  value="@entry.Text"
+                                                  @onchange="e => EditComment(entry.Id, e.Value?.ToString())"></textarea>
+                                    }
+                                    else
+                                    {
+                                        <div style="color:var(--text-muted);font-size:0.85rem">@entry.Text</div>
+                                    }
                                 </div>
-                                <button type="button" class="btn icon danger" aria-label="Delete comment"
-                                        @onclick="() => Delete(entry.Id)">&times;</button>
+                                <div style="display:flex;gap:0.3rem">
+                                    <button type="button" class="btn icon" aria-label="@("Select " + entry.Kind.ToLowerInvariant() + " on the page")"
+                                            title="Select on the page" @onclick="() => Reveal(entry.Id)">&#8599;</button>
+                                    <button type="button" class="btn icon danger" aria-label="@("Delete " + entry.Kind.ToLowerInvariant())"
+                                            @onclick="() => Delete(entry.Id)">&times;</button>
+                                </div>
                             </div>
                         </li>
                     }
@@ -87,7 +105,7 @@
 </div>
 
 @code {
-    private sealed record AnnotationEntry(Guid Id, string Kind, string Text);
+    private sealed record AnnotationEntry(Guid Id, string Kind, string Text, bool Editable);
 
     private InkCanvas? _canvas;
     private readonly InkDocument _document = new(new DocumentSettings { Width = 620, Height = 620, Background = InkColor.White });
@@ -97,15 +115,18 @@
     private string _color = "#fde047";
     private ITool _tool = new ShapeTool(ShapeKind.Highlight);
     private Brush _brush = new PenBrush { Width = 2.5f, Color = InkColor.Parse("#b91c1c") };
+    private ShapeStyle _shapeStyle = new() { StrokeColor = InkColor.Parse("#fde047"), StrokeWidth = 1.5f };
     private readonly List<AnnotationEntry> _annotations = new();
     private int _commentNumber;
 
-    private static readonly (string Color, string Name)[] HighlightColors =
+    private static readonly string[] HighlightColors = ["#fde047", "#86efac", "#93c5fd", "#fca5a5"];
+
+    private static readonly (string Id, string Label)[] Tools =
     [
-        ("#fde047", "Yellow"),
-        ("#86efac", "Green"),
-        ("#93c5fd", "Blue"),
-        ("#fca5a5", "Red"),
+        ("select", "Select"),
+        ("highlight", "Highlight text"),
+        ("callout", "Add comment"),
+        ("draw", "Freehand"),
     ];
 
     private static readonly string[] Paragraph =
@@ -141,7 +162,14 @@
         BuildPage();
         _document.UpdateLayer(_pageLayer, p => p with { IsLocked = true });
         _annotationLayer = _document.AddLayer("Annotations").Id;
+
+        // Listening to the document itself, rather than the canvas callback, means the conversion below runs
+        // while the change is still being reported, so it joins the same undo step: one undo removes a
+        // highlight entirely instead of first turning it back into a plain one.
+        _document.Changed += OnDocumentEdited;
     }
+
+    public void Dispose() => _document.Changed -= OnDocumentEdited;
 
     /// <summary>Lays out the document text as real text elements, so it can be selected, exported and read.</summary>
     private void BuildPage()
@@ -188,16 +216,35 @@
     private void SetColor(string color)
     {
         _color = color;
+        // The shape tool draws highlights in the shape style's stroke colour.
+        _shapeStyle = _shapeStyle with { StrokeColor = InkColor.Parse(color) };
         SelectTool(_toolId);
+    }
+
+    private void OnDocumentEdited(object? sender, DocumentChangedEventArgs args)
+    {
+        // Only fresh local edits are converted: undo and redo replay a conversion that already happened.
+        if (args.Origin != ChangeOrigin.Local || args.Depth > 0) return;
+        foreach (AddElementOperation add in AddedElements(args.Operation))
+        {
+            if (add.LayerId == _annotationLayer) Convert(add.Element);
+        }
+    }
+
+    private static IEnumerable<AddElementOperation> AddedElements(DrawingOperation operation)
+    {
+        if (operation is AddElementOperation add) yield return add;
+        else if (operation is BatchOperation batch)
+        {
+            foreach (DrawingOperation inner in batch.Operations)
+            {
+                foreach (AddElementOperation nested in AddedElements(inner)) yield return nested;
+            }
+        }
     }
 
     private void OnDocumentChanged(DocumentChangedEventArgs args)
     {
-        // Turn a freshly drawn shape into the right kind of annotation and index it for the comment list.
-        if (args.Operation is BlazorInk.Operations.AddElementOperation add && add.LayerId == _annotationLayer)
-        {
-            Convert(add.Element);
-        }
         Reindex();
         StateHasChanged();
     }
@@ -206,10 +253,9 @@
     {
         switch (_toolId)
         {
-            case "highlight" when element is HighlightElement highlight && highlight.Color != InkColor.Parse(_color):
+            case "highlight" when element is HighlightElement highlight:
                 _document.ReplaceElement(highlight with
                 {
-                    Color = InkColor.Parse(_color),
                     Description = "Highlight over " + DescribeTextUnder(highlight.Bounds),
                 });
                 break;
@@ -254,9 +300,29 @@
                 Stroke => "Freehand note",
                 _ => element.TypeName,
             };
-            _annotations.Add(new AnnotationEntry(element.Id, kind, element.GetAccessibleDescription()));
+            string text = element is CalloutElement callout ? callout.Text : element.GetAccessibleDescription();
+            _annotations.Add(new AnnotationEntry(element.Id, kind, text, element is CalloutElement));
         }
     }
+
+    private void EditComment(Guid id, string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text) || !_document.TryGetElement(id, out InkElement? element)) return;
+        if (element is not CalloutElement callout || callout.Text == text) return;
+        _document.ReplaceElement(callout with { Text = text, Description = text });
+        _canvas?.Refresh();
+    }
+
+    private void Reveal(Guid id)
+    {
+        if (_canvas is null) return;
+        if (_toolId != "select") SelectTool("select");
+        _canvas.Selection.Set(id);
+    }
+
+    private Task ExportSvgAsync()
+        => _canvas?.SaveSvgAsync("review.svg", new SvgExportOptions { IncludeElementDescriptions = true, Title = "Document review" })
+           ?? Task.CompletedTask;
 
     private void Delete(Guid id)
     {

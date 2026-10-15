@@ -32,23 +32,26 @@
 
         <div class="toolbar-separator"></div>
 
-        <div class="toolbar-group" role="group" aria-label="Colour">
-            @foreach (string color in Palette)
-            {
-                <button type="button" class="swatch @(_color == color ? "active" : null)" style="background:@color"
-                        aria-label="@color" @onclick="() => SetColor(color)"></button>
-            }
-        </div>
+        <ColorSwatches Colors="Palette" Value="@_color" ValueChanged="SetColor" />
 
         <div class="toolbar-spacer"></div>
 
         <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanUndo)" @onclick="() => _canvas?.Undo()">Undo</button>
-        <button type="button" class="btn" @onclick="ExportPngAsync">Export PNG</button>
-        <button type="button" class="btn" @onclick="ExportSvgAsync">Export SVG</button>
+        <button type="button" class="btn" disabled="@(_canvas is null || !_canvas.History.CanRedo)" @onclick="() => _canvas?.Redo()">Redo</button>
+    </div>
+
+    <div class="toolbar" style="border-top:none">
+        <button type="button" class="btn danger" disabled="@(_canvas is null || _canvas.Selection.IsEmpty)"
+                @onclick="() => _canvas?.DeleteSelection()">Delete selected</button>
+        <button type="button" class="btn danger" disabled="@(AnnotationCount == 0)" @onclick="ClearAnnotations">Clear annotations</button>
+        <span class="field"><strong>@AnnotationCount</strong>&nbsp;annotations</span>
+        <div class="toolbar-spacer"></div>
+        <button type="button" class="btn" disabled="@_document.IsEmpty" @onclick="ExportPngAsync">Export PNG</button>
+        <button type="button" class="btn" disabled="@_document.IsEmpty" @onclick="ExportSvgAsync">Export SVG</button>
     </div>
 
     <div class="canvas-host">
-        <InkCanvas @ref="_canvas"
+        <InkCanvas @ref="_canvas" HistoryChanged="() => StateHasChanged()"
                    Document="_document"
                    Height="560px"
                    Tool="_tool"
@@ -58,6 +61,7 @@
                    EnableTouchGestures="true"
                    AriaLabel="Image annotation canvas"
                    DocumentChanged="() => StateHasChanged()"
+                   SelectionChanged="() => StateHasChanged()"
                    Ready="OnReadyAsync" />
     </div>
 
@@ -113,9 +117,22 @@
         _annotationLayer = _document.AddLayer("Annotations").Id;
     }
 
+    private int AnnotationCount => _document.TryGetLayer(_annotationLayer, out Layer? layer) ? layer.Elements.Count : 0;
+
     private async Task OnReadyAsync()
     {
-        if (_document.IsEmpty) await LoadSampleAsync();
+        if (!_document.IsEmpty) return;
+        await LoadSampleAsync();
+        // The picture the page opens with is the starting point, not an edit: undo should not take it away.
+        _canvas?.History.Clear();
+        StateHasChanged();
+    }
+
+    private void ClearAnnotations()
+    {
+        if (!_document.TryGetLayer(_annotationLayer, out Layer? layer)) return;
+        _document.RemoveElements(layer.Elements.Select(e => e.Id).ToArray());
+        _canvas?.Refresh();
     }
 
     private void SelectTool(string id)
@@ -182,24 +199,31 @@
     {
         if (_canvas is null) return;
 
-        // Replace any previous image and fit the new one to the page.
-        var existing = _document.Layers.SelectMany(l => l.Elements).OfType<ImageElement>().Select(e => e.Id).ToList();
-        if (existing.Count > 0) _document.RemoveElements(existing);
-
-        _document.UpdateLayer(_imageLayer, p => p with { IsLocked = false });
-        ImageElement? placed = await _canvas.AddImageAsync(source, Vector2.Zero, maxWidth: _document.Settings.Width - 40);
-        if (placed is null) return;
-
-        // Center it on the page, then lock the layer so annotating cannot move the picture.
-        Rect page = _document.Settings.PageRect;
-        Vector2 offset = page.Center - placed.Rect.Center;
-        _document.ReplaceElement(placed with
+        // Swapping the picture is several edits - remove the old one, add, centre, move to its layer, lock - but
+        // to the person using it it is one action, so it is one undo step.
+        ImageElement? placed;
+        using (_canvas.History.BeginGroup("Open image"))
         {
-            Rect = placed.Rect.Offset(offset),
-            Description = "Annotated image: " + name,
-        });
-        MoveToImageLayer(placed.Id);
-        _document.UpdateLayer(_imageLayer, p => p with { IsLocked = true });
+            var existing = _document.Layers.SelectMany(l => l.Elements).OfType<ImageElement>().Select(e => e.Id).ToList();
+            if (existing.Count > 0) _document.RemoveElements(existing);
+
+            _document.UpdateLayer(_imageLayer, p => p with { IsLocked = false });
+            placed = await _canvas.AddImageAsync(source, Vector2.Zero, maxWidth: _document.Settings.Width - 40);
+            if (placed is not null)
+            {
+                // Center it on the page, then lock the layer so annotating cannot move the picture.
+                Rect page = _document.Settings.PageRect;
+                Vector2 offset = page.Center - placed.Rect.Center;
+                _document.ReplaceElement(placed with
+                {
+                    Rect = placed.Rect.Offset(offset),
+                    Description = "Annotated image: " + name,
+                });
+                MoveToImageLayer(placed.Id);
+            }
+            _document.UpdateLayer(_imageLayer, p => p with { IsLocked = true });
+        }
+        if (placed is null) return;
 
         _imageInfo = $"{name}: {placed.Source.Width} by {placed.Source.Height} pixels";
         _canvas.Refresh();

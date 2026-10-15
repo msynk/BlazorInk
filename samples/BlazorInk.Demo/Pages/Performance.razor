@@ -34,7 +34,7 @@
         <button type="button" class="btn primary" disabled="@_busy" @onclick="GenerateAsync">Generate</button>
         <button type="button" class="btn" disabled="@(_busy || _document.IsEmpty)" @onclick="MeasureAsync">Measure</button>
         <div class="toolbar-spacer"></div>
-        <button type="button" class="btn danger" @onclick="() => { _document.Clear(); _results.Clear(); _canvas?.Refresh(); }">Clear</button>
+        <button type="button" class="btn danger" disabled="@(_busy || _document.IsEmpty)" @onclick="Clear">Clear</button>
     </div>
 
     <div class="canvas-host">
@@ -52,7 +52,7 @@
     <CanvasStatus Canvas="_canvas">
         @if (_busy)
         {
-            <span><strong>working...</strong></span>
+            <span role="status"><strong>@(_step ?? "working")...</strong></span>
         }
     </CanvasStatus>
 </div>
@@ -94,6 +94,25 @@
     private int _strokeCount = 2000;
     private int _pointsPerStroke = 60;
     private bool _busy;
+    private string? _step;
+
+    private void Clear()
+    {
+        _document.Clear();
+        _results.Clear();
+        _canvas?.Refresh();
+    }
+
+    /// <summary>
+    /// Shows the step about to run and lets the browser paint before it starts. WebAssembly runs on the page's
+    /// only thread, so without this the whole measurement would appear as one long freeze.
+    /// </summary>
+    private async Task StepAsync(string name)
+    {
+        _step = name;
+        StateHasChanged();
+        await Task.Delay(1);
+    }
 
     private void OnCountChanged(ChangeEventArgs e)
     {
@@ -109,8 +128,7 @@
     {
         _busy = true;
         _results.Clear();
-        StateHasChanged();
-        await Task.Yield();
+        await StepAsync("Building the document");
 
         var stopwatch = Stopwatch.StartNew();
         _document.Clear();
@@ -161,11 +179,10 @@
     private async Task MeasureAsync()
     {
         _busy = true;
-        StateHasChanged();
-        await Task.Yield();
 
         _results.RemoveAll(m => m.Name != "Build document");
 
+        await StepAsync("Generating geometry");
         // Geometry generation: the cost of turning every stroke into a fillable outline once.
         var stopwatch = Stopwatch.StartNew();
         int vertices = 0;
@@ -177,6 +194,7 @@
         _results.Add(new Measurement("Generate all geometry", $"{stopwatch.Elapsed.TotalMilliseconds:0} ms",
             $"{vertices:N0} path segments, cached afterwards so redraws reuse them"));
 
+        await StepAsync("Recording a full redraw");
         // A cached redraw: what every pan, zoom or committed stroke costs.
         stopwatch.Restart();
         var recorder = new BlazorInk.Canvas.CanvasRenderContext(1 << 16);
@@ -185,6 +203,7 @@
         _results.Add(new Measurement("Record a full redraw", $"{stopwatch.Elapsed.TotalMilliseconds:0} ms",
             $"{recorder.Count:N0} canvas commands for the whole document"));
 
+        await StepAsync("Recording the visible region");
         // The realistic case: only what is on screen.
         Rect visible = _canvas?.CurrentViewport.VisibleRect(_canvas.ViewSize) ?? new Rect(0, 0, 800, 420);
         stopwatch.Restart();
@@ -194,6 +213,7 @@
         _results.Add(new Measurement("Record the visible region", $"{stopwatch.Elapsed.TotalMilliseconds:0} ms",
             $"{culled.Count:N0} commands, which is what a real redraw costs"));
 
+        await StepAsync("Hit testing");
         // Hit testing, the cost of a click with the selection tool.
         stopwatch.Restart();
         int hits = 0;
@@ -206,6 +226,7 @@
         _results.Add(new Measurement("Hit test", $"{stopwatch.Elapsed.TotalMilliseconds / 200d * 1000:0} us per click",
             $"{hits} of 200 probes landed on a stroke"));
 
+        await StepAsync("Saving and loading");
         // Serialization.
         stopwatch.Restart();
         byte[] saved = BlazorInk.Serialization.InkSerializer.SerializeToUtf8Bytes(_document);
@@ -221,6 +242,7 @@
         _results.Add(new Measurement("Load", $"{stopwatch.Elapsed.TotalMilliseconds:0} ms",
             $"{reloaded.ElementCount:N0} elements restored"));
 
+        await StepAsync("Exporting SVG");
         // SVG export.
         stopwatch.Restart();
         string svg = SvgExporter.Export(_document);
@@ -229,6 +251,7 @@
             $"{svg.Length / 1024.0:N0} KB of vector paths"));
 
         _busy = false;
+        _step = null;
         StateHasChanged();
     }
 }

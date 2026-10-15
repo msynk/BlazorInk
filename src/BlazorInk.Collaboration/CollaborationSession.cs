@@ -56,11 +56,14 @@ public sealed class CollaborationSession : IAsyncDisposable
     private readonly Queue<CollaborationMessage> _pending = new();
     private readonly object _queueGate = new();
     private readonly SemaphoreSlim _flushGate = new(1, 1);
+    // Who wrote the version of each element this replica holds, which is what a version tie is settled on.
+    private readonly Dictionary<Guid, string> _writers = new();
     private DateTimeOffset _lastExpiryCheck = DateTimeOffset.MinValue;
     private long _sequence;
     private DateTimeOffset _lastPresenceSent = DateTimeOffset.MinValue;
     private PresenceState? _pendingPresence;
     private bool _applyingRemote;
+    private bool _awaitingSnapshot;
     private bool _disposed;
 
     /// <summary>Creates a session for a document.</summary>
@@ -115,22 +118,36 @@ public sealed class CollaborationSession : IAsyncDisposable
     /// <summary>Raised when a remote operation could not be applied, with the reason.</summary>
     public event Action<string>? RemoteOperationRejected;
 
-    /// <summary>Asks the other participants for a full document, used when joining an existing session.</summary>
+    /// <summary>
+    /// Asks the other participants for a full document, used when joining an existing session. Every participant
+    /// that serves snapshots answers, addressed to this one alone; the first answer is applied and the rest are
+    /// ignored, so edits made after it are not overwritten by a slower, older copy.
+    /// </summary>
     public Task RequestSnapshotAsync(CancellationToken cancellationToken = default)
-        => SendAsync(new CollaborationMessage
+    {
+        // Set before sending: over an in-process transport the answer can arrive before the send returns.
+        _awaitingSnapshot = true;
+        return SendAsync(new CollaborationMessage
         {
             Kind = CollaborationMessageKind.SnapshotRequest,
             SenderId = ParticipantId,
             DocumentId = _document.Id,
             Sequence = Interlocked.Increment(ref _sequence),
         }, cancellationToken);
+    }
 
-    /// <summary>Sends the current document to the other participants.</summary>
-    public Task SendSnapshotAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Sends the current document to every other participant, each of whom replaces their own copy with it. Use it
+    /// to reset everyone to one version, for example after restoring a saved document.
+    /// </summary>
+    public Task SendSnapshotAsync(CancellationToken cancellationToken = default) => SendSnapshotAsync(null, cancellationToken);
+
+    private Task SendSnapshotAsync(string? recipientId, CancellationToken cancellationToken)
         => SendAsync(new CollaborationMessage
         {
             Kind = CollaborationMessageKind.Snapshot,
             SenderId = ParticipantId,
+            RecipientId = recipientId,
             DocumentId = _document.Id,
             Sequence = Interlocked.Increment(ref _sequence),
             Snapshot = InkSerializer.Serialize(_document, _options.SerializerOptions),
@@ -253,6 +270,7 @@ public sealed class CollaborationSession : IAsyncDisposable
         // Remote changes are not echoed back, but local undo and redo are: to everyone else they are ordinary edits.
         if (_applyingRemote || _disposed) return;
         if (e.Origin is ChangeOrigin.Remote or ChangeOrigin.Load) return;
+        RecordWriter(e.Operation, ParticipantId);
 
         string payload;
         try
@@ -282,6 +300,7 @@ public sealed class CollaborationSession : IAsyncDisposable
         // A queue that is not yet drained must not be overtaken. The transport contract is that one sender's
         // messages arrive in order, and a receiver discards anything that arrives behind a later sequence.
         bool queued = false;
+        bool heldBack = false;
         if (message.Kind == CollaborationMessageKind.Operation)
         {
             lock (_queueGate)
@@ -293,6 +312,18 @@ public sealed class CollaborationSession : IAsyncDisposable
                     queued = true;
                 }
             }
+        }
+        else if (message.Kind == CollaborationMessageKind.Presence)
+        {
+            // Presence shares the sequence counter with operations, so sending it past queued operations would
+            // make every receiver discard those operations as late arrivals once the queue drains. It waits for
+            // the next FlushPresenceAsync instead, unless a newer state is already waiting.
+            lock (_queueGate) heldBack = _pending.Count > 0;
+        }
+        if (heldBack)
+        {
+            _pendingPresence ??= message.Presence;
+            return;
         }
         if (queued)
         {
@@ -328,6 +359,8 @@ public sealed class CollaborationSession : IAsyncDisposable
     {
         if (_disposed || message is null) return;
         if (string.Equals(message.SenderId, ParticipantId, StringComparison.Ordinal)) return;
+        // Addressed to someone else: a transport that broadcasts everything delivers it here too.
+        if (message.RecipientId is { } recipient && !string.Equals(recipient, ParticipantId, StringComparison.Ordinal)) return;
 
         // A host that renders presence from the event rather than polling Participants would otherwise never
         // expire anyone, so expiry is also driven by traffic. The check is throttled to stay off the hot path.
@@ -359,10 +392,14 @@ public sealed class CollaborationSession : IAsyncDisposable
                 }
                 break;
             case CollaborationMessageKind.Snapshot:
-                ApplySnapshot(message);
+                // An answer to a request is applied once, by the participant that asked: replacing the document
+                // with every answer, or answers meant for someone else joining, would throw away whatever was
+                // drawn since the first one. A snapshot sent to everyone is a deliberate reset and always applies.
+                if (message.RecipientId is null) ApplySnapshot(message);
+                else if (_awaitingSnapshot && ApplySnapshot(message)) _awaitingSnapshot = false;
                 break;
             case CollaborationMessageKind.SnapshotRequest:
-                if (_options.ServeSnapshots) await SendSnapshotAsync().ConfigureAwait(false);
+                if (_options.ServeSnapshots) await SendSnapshotAsync(message.SenderId, CancellationToken.None).ConfigureAwait(false);
                 break;
             case CollaborationMessageKind.Leave:
                 Forget(message.SenderId);
@@ -398,6 +435,7 @@ public sealed class CollaborationSession : IAsyncDisposable
         try
         {
             _document.Apply(operation, ChangeOrigin.Remote);
+            RecordWriter(operation, message.SenderId);
         }
         catch (InvalidOperationException ex)
         {
@@ -413,6 +451,12 @@ public sealed class CollaborationSession : IAsyncDisposable
     /// Applies last-writer-wins to element edits. When the local element is newer the remote edit is dropped;
     /// when versions tie, the participant id decides so that every replica reaches the same result.
     /// </summary>
+    /// <remarks>
+    /// A tie is between the participant who wrote the version this replica holds and the sender, not between
+    /// this replica and the sender. With three or more participants those differ: a bystander holding one
+    /// editor's version would otherwise judge the other editor's version against its own id, and could keep a
+    /// different winner from the one both editors settled on.
+    /// </remarks>
     /// <returns>The operation to apply, or null when it lost the conflict and must be dropped.</returns>
     private DrawingOperation? ResolveConflicts(DrawingOperation operation, string senderId)
     {
@@ -421,7 +465,13 @@ public sealed class CollaborationSession : IAsyncDisposable
             case ReplaceElementOperation replace when _document.TryGetElement(replace.Element.Id, out InkElement? current):
             {
                 if (current.Version > replace.Element.Version) return null;
-                if (current.Version == replace.Element.Version && string.CompareOrdinal(ParticipantId, senderId) > 0) return null;
+                if (current.Version == replace.Element.Version)
+                {
+                    // A version this session did not see being written (loaded, or from a snapshot) falls back to
+                    // this participant's id, which is the rule two participants have always used.
+                    string writer = _writers.GetValueOrDefault(replace.Element.Id, ParticipantId);
+                    if (string.CompareOrdinal(writer, senderId) > 0) return null;
+                }
                 return replace;
             }
             case BatchOperation batch:
@@ -439,9 +489,33 @@ public sealed class CollaborationSession : IAsyncDisposable
         }
     }
 
-    private void ApplySnapshot(CollaborationMessage message)
+    /// <summary>Remembers who wrote the version of each element an applied operation leaves behind.</summary>
+    private void RecordWriter(DrawingOperation operation, string writer)
     {
-        if (message.Snapshot is not { Length: > 0 } payload) return;
+        switch (operation)
+        {
+            case AddElementOperation add:
+                _writers[add.Element.Id] = writer;
+                break;
+            case ReplaceElementOperation replace:
+                _writers[replace.Element.Id] = writer;
+                break;
+            case RemoveElementOperation remove:
+                _writers.Remove(remove.ElementId);
+                break;
+            case AddLayerOperation { Elements: { } elements }:
+                foreach (InkElement element in elements) _writers[element.Id] = writer;
+                break;
+            case BatchOperation batch:
+                foreach (DrawingOperation inner in batch.Operations) RecordWriter(inner, writer);
+                break;
+        }
+    }
+
+    /// <summary>Replaces the document with the one in the message. Returns false when it could not be applied.</summary>
+    private bool ApplySnapshot(CollaborationMessage message)
+    {
+        if (message.Snapshot is not { Length: > 0 } payload) return false;
         InkDocument incoming;
         try
         {
@@ -450,7 +524,7 @@ public sealed class CollaborationSession : IAsyncDisposable
         catch (InkFormatException ex)
         {
             RemoteOperationRejected?.Invoke("The received document could not be read: " + ex.Message);
-            return;
+            return false;
         }
 
         // Build the whole change first, then apply it. Removing the local content before discovering that the
@@ -480,17 +554,36 @@ public sealed class CollaborationSession : IAsyncDisposable
             if (!incoming.TryGetLayer(layer.Id, out _)) operations.Add(new RemoveLayerOperation(layer.Id));
         }
 
-        if (operations.Count == 0) return;
+        // The rest of the document comes along too. Without these a joining participant kept its own page size,
+        // background and metadata, and layers it already had stayed wherever they were in its own stack, so the
+        // two replicas drew the same layers in a different order.
+        for (int i = 0; i < incoming.Layers.Count; i++) operations.Add(new ReorderLayerOperation(incoming.Layers[i].Id, i));
+        if (_document.Settings != incoming.Settings) operations.Add(new UpdateSettingsOperation(incoming.Settings));
+        foreach (string key in _document.Metadata.Keys)
+        {
+            if (!incoming.Metadata.ContainsKey(key)) operations.Add(new SetMetadataOperation(key, null));
+        }
+        foreach ((string key, string value) in incoming.Metadata)
+        {
+            if (!_document.Metadata.TryGetValue(key, out string? current) || current != value) operations.Add(new SetMetadataOperation(key, value));
+        }
+
+        // Already identical: nothing to change, and the request has been answered.
+        if (operations.Count == 0) return true;
 
         _applyingRemote = true;
         try
         {
             // A batch rolls back on failure, so a snapshot either lands completely or not at all.
             _document.Apply(new BatchOperation(operations, "Synchronize"), ChangeOrigin.Remote);
+            // Who wrote each incoming version is not part of a snapshot.
+            _writers.Clear();
+            return true;
         }
         catch (InvalidOperationException ex)
         {
             RemoteOperationRejected?.Invoke("The received document could not be applied: " + ex.Message);
+            return false;
         }
         finally
         {

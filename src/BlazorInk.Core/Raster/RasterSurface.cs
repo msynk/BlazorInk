@@ -193,6 +193,17 @@ public sealed class RasterSurface
                 float db = _pixels[offset + 2] / 255f;
                 float da = _pixels[offset + 3] / 255f;
 
+                if (blend == BlendMode.DestinationOut)
+                {
+                    // The group's alpha removes what is beneath it, as Blend does for a single shape.
+                    float keep = 1f - sa;
+                    _pixels[offset] = ToByte(dr * keep);
+                    _pixels[offset + 1] = ToByte(dg * keep);
+                    _pixels[offset + 2] = ToByte(db * keep);
+                    _pixels[offset + 3] = ToByte(da * keep);
+                    continue;
+                }
+
                 if (blend != BlendMode.Normal && da > 0.0001f)
                 {
                     float ur = sr / sa, ug = sg / sa, ub = sb / sa;

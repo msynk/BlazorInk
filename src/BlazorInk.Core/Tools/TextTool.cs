@@ -135,6 +135,9 @@ public sealed class TextTool : ToolBase
             if (string.IsNullOrWhiteSpace(text))
             {
                 context.Document.RemoveElement(element.Id);
+                // A box placed and then left blank never happened as far as undo cares, exactly as when the edit
+                // is cancelled; recording it would leave an undo step that does nothing.
+                if (_createdElementId == element.Id) context.History.CancelGroup();
                 context.InvalidateDocument(element.Bounds);
                 return;
             }
