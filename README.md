@@ -1,3 +1,5 @@
+**Note**: moved to bitplatform (https://bink.bitplatform.dev)
+
 # BlazorInk
 
 A native drawing and ink engine for Blazor.
